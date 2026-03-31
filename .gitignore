@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Model weights and checkpoints
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+checkpoints/
+
+# Third-party dependencies (submodules / cloned repos)
+FoundationModel/third-party/
+
+# Depth-Anything / GroundingDINO / SAM2 weights
+weights/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.blg
+*.log
+*.out
+*.synctex.gz
+*.fdb_latexmk
+*.fls
+*.toc
+*.lof
+*.lot
+*.nav
+*.snm
+*.vrb
+*.dvi
+
+# Video recordings from visual servoing runs
+*.mp4
+*.avi
+
+# Jupyter
+.ipynb_checkpoints/
+
+# PyTorch / CUDA
+*.onnx
