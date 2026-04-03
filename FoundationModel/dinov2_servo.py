@@ -17,6 +17,7 @@ Usage:
         --reference input_image_transparent.png \\
         [--no-pyzed] [--no-robot]
 """
+import csv
 import logging
 import time
 import sys
@@ -41,7 +42,7 @@ THIRD_PARTY_ROOT = os.path.join(os.path.dirname(__file__), "third-party")
 # ── Import DINOv2 matching pipeline ──────────────────────────────────
 from dinov2_match_segment import (
     extract_patch_features,
-    compute_color_similarity,
+    compute_resnet_similarity,
     compute_similarity_map,
     combine_similarity_maps,
     similarity_to_bbox,
@@ -56,11 +57,13 @@ from negative_weighing import (
     _robust_centroid,
     _mask_iou,
     _get_sam2,
+    _get_depth_model,
     ROBOT_IP,
     MIN_RECORDING_DIM, ZED_RESOLUTION,
     NEG_POINT_COUNT,
     IOU_DRIFT_THRESH,
     PYZED_AVAILABLE,
+    VS_RATE, VS_APPROACH, VS_SPEED, VS_MVACC,
 )
 
 try:
@@ -74,6 +77,10 @@ try:
 except Exception:
     torch = None
     DEVICE = "cpu"
+
+# ── EKF imports ─────────────────────────────────────────────────────
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "EKF"))
+from ekf_servo import PoseEKF, PBVSController, CameraIntrinsics, DepthScaler
 
 # ── DINOv2 matching parameters ───────────────────────────────────────
 DINOV2_THRESHOLD_PCT = 93      # percentile for similarity thresholding
@@ -137,7 +144,7 @@ class ReferenceModel:
 
     def detect_in_scene(self, scene_bgr: np.ndarray):
         """
-        Run DINOv2+color matching on a scene image.
+        Run DINOv2+ResNet matching on a scene image.
 
         Returns
         -------
@@ -145,50 +152,53 @@ class ReferenceModel:
         sam_mask : (H, W) uint8 binary mask or None
         sam_score : float
         sim_upscaled : (H, W) similarity heatmap
+        sam_logits : (1, 256, 256) low-res SAM2 logits, or None
         """
         sh, sw = scene_bgr.shape[:2]
 
-        # Extract scene features
         scene_features, scene_proc_h, scene_proc_w = \
             extract_patch_features(scene_bgr, PATCH_SIZE)
 
-        # DINOv2 similarity
         dinov2_sim = compute_similarity_map(
             self.ref_features, self.ref_mask_patches, scene_features)
 
-        # Color similarity
-        color_sim = compute_color_similarity(
+        resnet_sim = compute_resnet_similarity(
             self.ref_bgr, self.ref_alpha, scene_bgr,
             scene_proc_h, scene_proc_w, PATCH_SIZE)
 
-        # Combine
         sim_map = combine_similarity_maps(
-            dinov2_sim, color_sim,
+            dinov2_sim, resnet_sim,
             alpha=1.0 - DINOV2_COLOR_WEIGHT)
 
-        # Extract bbox
         bbox, _, sim_upscaled = similarity_to_bbox(
             sim_map, sh, sw, PATCH_SIZE, DINOV2_THRESHOLD_PCT)
 
-        logger.info(f"DINOv2+Color bbox: {bbox}")
+        logger.info("DINOv2 bbox: %s", bbox)
 
-        # SAM2 refinement
-        sam_mask, sam_score = refine_with_sam2(scene_bgr, bbox)
+        if bbox is None:
+            return None, None, 0.0, sim_upscaled, None
+
+        sam_mask, sam_score, sam_logits = refine_with_sam2(
+            scene_bgr, bbox, return_logits=True)
         mask_area = np.count_nonzero(sam_mask)
-        logger.info(f"SAM2 mask: score={sam_score:.3f}, "
-                    f"area={mask_area}px ({100.0 * mask_area / (sh * sw):.1f}%)")
+        logger.info("SAM2 mask: score=%.3f, area=%dpx (%.1f%%)",
+                     sam_score, mask_area, 100.0 * mask_area / (sh * sw))
 
-        return bbox, sam_mask, sam_score, sim_upscaled
+        return bbox, sam_mask, sam_score, sim_upscaled, sam_logits
 
 
 # ═════════════════════════════════════════════════════════════════════
 #  Core pipeline: DINOv2 detection + SAM2 propagation
 # ═════════════════════════════════════════════════════════════════════
 
+_MAX_REDETECT_DEPTH = 1  # max recursive re-detection attempts per frame
+
+
 def run_dinov2_pipeline(
     image_bgr: np.ndarray,
     ref_model: ReferenceModel,
     tracker: MaskTracker,
+    _redetect_depth: int = 0,
 ) -> dict:
     """
     Detection → SAM2 segmentation → centroid pipeline.
@@ -198,48 +208,31 @@ def run_dinov2_pipeline(
       2. tracker.anchor_logits – stable anchor (after drift reset)
       3. DINOv2 fresh detection – initial frame or periodic re-detection
     """
-    res = dict(mask_np=None, best_centroid=None, bbox=None)
+    res = dict(mask_np=None, best_centroid=None, bbox=None, mode="track")
     h, w = image_bgr.shape[:2]
 
     # ── Decide whether to run full DINOv2 detection this frame ────────
-    need_detection = False
-    if tracker.prev_logits is None and not tracker.anchor_locked:
-        # First frame or no tracking state at all
-        need_detection = True
-    elif tracker.frame_count > 0 and tracker.frame_count % DINOV2_REDETECT_INTERVAL == 0:
-        need_detection = True
+    no_prior = tracker.prev_logits is None and not tracker.anchor_locked
+    periodic = tracker.frame_count > 0 and tracker.frame_count % DINOV2_REDETECT_INTERVAL == 0
+    need_detection = no_prior or periodic
 
     # ── Path A: Full DINOv2 detection ────────────────────────────────
     if need_detection:
         logger.info("--- Running DINOv2 detection ---")
-        bbox, sam_mask, sam_score, sim_upscaled = \
+        res["mode"] = "detect"
+        bbox, sam_mask, sam_score, sim_upscaled, sam_logits = \
             ref_model.detect_in_scene(image_bgr)
         res["bbox"] = bbox
 
         if sam_mask is not None and sam_score > 0.5:
             res["mask_np"] = sam_mask
+            centroid = _robust_centroid(sam_mask)
+            res["best_centroid"] = centroid
 
-            # Get SAM2 logits for anchor seeding
-            pred = _get_sam2()
-            rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-            pred.set_image(rgb)
-            x1, y1, x2, y2 = bbox
-            box_np = np.array([x1, y1, x2, y2], dtype=np.float32)
-            masks, scores, logits = pred.predict(
-                box=box_np, multimask_output=True, return_logits=True)
-
-            if masks is not None and len(masks) > 0:
-                best_idx = int(np.argmax(scores))
-                tracker_logits = logits[best_idx:best_idx + 1]
-
-                centroid = _robust_centroid(sam_mask)
-                res["best_centroid"] = centroid
-
-                tracker.update(sam_mask, tracker_logits, centroid)
-                logger.info(f"DINOv2 detection done. Centroid: {centroid}, "
-                            f"anchor_locked: {tracker.anchor_locked}")
-            else:
-                tracker.update(sam_mask, None, _robust_centroid(sam_mask))
+            # Logits come directly from detect_in_scene (no second SAM2 call)
+            tracker.update(sam_mask, sam_logits, centroid)
+            logger.info(f"DINOv2 detection done. Centroid: {centroid}, "
+                        f"anchor_locked: {tracker.anchor_locked}")
         else:
             logger.info("DINOv2 detection: low SAM2 score or no mask")
             tracker.update(None, None, None)
@@ -247,6 +240,18 @@ def run_dinov2_pipeline(
         return res
 
     # ── Path B: SAM2 propagation (fast path, most frames) ────────────
+
+    def _try_redetect(reason: str):
+        """Reset tracker and recurse if recursion budget remains."""
+        if _redetect_depth < _MAX_REDETECT_DEPTH:
+            logger.info("SAM2: %s, triggering re-detection", reason)
+            tracker.reset(keep_anchor=True)
+            return run_dinov2_pipeline(
+                image_bgr, ref_model, tracker,
+                _redetect_depth=_redetect_depth + 1)
+        logger.warning("Max re-detection depth reached (%s)", reason)
+        return None
+
     try:
         pred = _get_sam2()
         rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
@@ -256,25 +261,19 @@ def run_dinov2_pipeline(
         point_coords = []
         point_labels = []
 
-        # Positive points from previous mask
         pos_pts = tracker.sample_positive_points(h, w, n=1)
         if pos_pts is not None:
-            for pt in pos_pts:
-                point_coords.append(pt)
-                point_labels.append(1)
+            point_coords.extend(pos_pts)
+            point_labels.extend([1] * len(pos_pts))
 
-        # Negative points from mask history
         neg_pts = tracker.sample_negative_points(h, w, NEG_POINT_COUNT)
         if neg_pts is not None:
-            for pt in neg_pts:
-                point_coords.append(pt)
-                point_labels.append(0)
-            logger.debug(f"SAM2 propagation: "
-                         f"+{len(pos_pts) if pos_pts is not None else 0} pos, "
-                         f"+{len(neg_pts)} neg points")
+            point_coords.extend(neg_pts)
+            point_labels.extend([0] * len(neg_pts))
+            logger.debug("SAM2 propagation: +%d pos, +%d neg points",
+                         len(pos_pts) if pos_pts is not None else 0,
+                         len(neg_pts))
 
-        # Use multimask_output=True until anchor is locked (better exploration),
-        # then switch to single-mask mode for stable propagation
         sam_kwargs = dict(
             multimask_output=not tracker.anchor_locked,
             return_logits=True,
@@ -284,14 +283,12 @@ def run_dinov2_pipeline(
             sam_kwargs["point_coords"] = np.array(point_coords, dtype=np.float32)
             sam_kwargs["point_labels"] = np.array(point_labels, dtype=np.int32)
 
-        # Mask-input priority chain
         if tracker.prev_logits is not None:
             sam_kwargs["mask_input"] = tracker.prev_logits
         elif tracker.anchor_logits is not None:
             sam_kwargs["mask_input"] = tracker.anchor_logits
             logger.info("SAM2: using anchor logits as prior")
 
-        # Run SAM2
         masks, scores_sam, logits = pred.predict(**sam_kwargs)
 
         if masks is not None and len(masks) > 0:
@@ -303,22 +300,24 @@ def run_dinov2_pipeline(
             if tracker.prev_mask is not None:
                 iou = _mask_iou(mask_out, tracker.prev_mask)
                 if iou < IOU_DRIFT_THRESH:
-                    logger.info(f"SAM2: IoU={iou:.2f} < {IOU_DRIFT_THRESH} — "
-                                f"drift detected, forcing DINOv2 re-detection")
-                    tracker.reset(keep_anchor=True)
-                    return run_dinov2_pipeline(image_bgr, ref_model, tracker)
+                    fallback = _try_redetect(
+                        f"IoU={iou:.2f} < {IOU_DRIFT_THRESH}")
+                    if fallback is not None:
+                        return fallback
+                    # Budget exhausted: use current mask anyway
 
             res["mask_np"] = mask_out
             centroid = _robust_centroid(mask_out)
             res["best_centroid"] = centroid
 
             tracker.update(mask_out, tracker_logits, centroid)
-            logger.debug(f"SAM2 propagation: score={scores_sam[best_idx]:.3f}, "
-                         f"centroid={centroid}")
+            logger.debug("SAM2 propagation: score=%.3f, centroid=%s",
+                         scores_sam[best_idx], centroid)
         else:
-            logger.info("SAM2 propagation: no mask — forcing DINOv2 re-detection")
-            tracker.reset(keep_anchor=True)
-            return run_dinov2_pipeline(image_bgr, ref_model, tracker)
+            fallback = _try_redetect("no mask returned")
+            if fallback is not None:
+                return fallback
+            tracker.update(None, None, None)
 
     except Exception as e:
         logger.exception("SAM2 propagation failed: %s", e)
@@ -340,6 +339,9 @@ class DINOv2CameraStreamer(threading.Thread):
     def __init__(self, cam_index: int, stop_event: threading.Event,
                  robot: RobotController,
                  ref_model: ReferenceModel,
+                 ekf: PoseEKF,
+                 pbvs: PBVSController,
+                 depth_scaler: DepthScaler,
                  use_pyzed: bool = True):
         super().__init__(daemon=True)
         self.cam_index = cam_index
@@ -356,11 +358,56 @@ class DINOv2CameraStreamer(threading.Thread):
         self._tracker = MaskTracker()
         self._undistorter = None
 
+        # EKF state estimation
+        self._ekf = ekf
+        self._pbvs = pbvs
+        self._depth_scaler = depth_scaler
+        self._last_servo_vel = np.zeros(3)  # last commanded velocity for egomotion
+
+        # Metrics CSV logger
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        self._csv_path = os.path.abspath(f"metrics_{ts}.csv")
+        self._csv_file = open(self._csv_path, "w", newline="")
+        self._csv_writer = csv.writer(self._csv_file)
+        self._csv_writer.writerow([
+            "timestamp", "frame", "dt_ms", "mode",
+            "centroid_u", "centroid_v",
+            "ekf_x", "ekf_y", "ekf_z",
+            "ekf_vx", "ekf_vy", "ekf_vz",
+            "ekf_uncertainty",
+            "depth_metric",
+            "servo_dx_mm", "servo_dy_mm", "servo_dz_mm",
+            "err_m", "iter_time_ms",
+        ])
+        self._frame_idx = 0
+        self._last_servo_cmd = (0.0, 0.0, 0.0, 0.0)  # dx, dy, dz, err
+        self._reset_event = threading.Event()  # signal EKF reset to _seg_loop
+        self._seg_thread = None  # reference for join on shutdown
+
     def _get_frame(self):
         with self._frame_lock:
             if self._latest_left is not None:
                 return self._latest_left.copy()
             return None
+
+    def _full_reset(self):
+        """Signal _seg_loop to reset tracker + EKF at a safe point."""
+        self._reset_event.set()
+
+    def _handle_key(self, key: int) -> bool:
+        """Process a keypress. Returns True if the event loop should break."""
+        if key == ord("q"):
+            self.stop_event.set()
+            return True
+        if key == ord("v") and self.robot is not None:
+            self.robot.enabled = not self.robot.enabled
+            logger.info("Servo: %s", "ON" if self.robot.enabled else "OFF")
+        elif key == ord("r"):
+            self._tracker.reset(keep_anchor=True)
+            logger.info("Tracker soft-reset (anchor kept)")
+        elif key == ord("R"):
+            self._full_reset()
+        return False
 
     def _run_calibration(self):
         logger.info("Calibration thread: waiting for models...")
@@ -368,27 +415,182 @@ class DINOv2CameraStreamer(threading.Thread):
         logger.info("Calibration thread: starting Y/Z Jacobian calibration.")
         self.robot.calibrate(self._get_frame)
 
-    # ── segmentation loop ─────────────────────────────────────────────
+    # ── segmentation + EKF loop ─────────────────────────────────────────
     def _seg_loop(self):
+        last_time = time.time()
+        depth_run_counter = 0
+
         while not self.stop_event.is_set():
+            # ── Check for full reset signal from camera thread ────
+            if self._reset_event.is_set():
+                self._tracker.reset(keep_anchor=False)
+                self._ekf.reset()
+                self._last_servo_vel = np.zeros(3)
+                self._reset_event.clear()
+                logger.info("Tracker + EKF FULL reset")
+
             with self._frame_lock:
                 frame = self._latest_left.copy() if self._latest_left is not None else None
             if frame is None:
                 time.sleep(0.1)
                 continue
             try:
+                iter_start = time.time()
+                dt = iter_start - last_time
+                last_time = iter_start
+
+                # ── 1. Perception: DINOv2 detection / SAM2 tracking ──
                 res = run_dinov2_pipeline(frame, self.ref_model, self._tracker)
+
+                # ── 2. EKF predict (always, even without measurement) ─
+                robot_vel_cam = self._last_servo_vel if np.any(self._last_servo_vel) else None
+                self._ekf.predict(dt, robot_vel_cam=robot_vel_cam)
+
+                centroid = res.get("best_centroid")
+                if centroid is not None:
+                    u, v = float(centroid[0]), float(centroid[1])
+
+                    # ── 3. Depth estimation (every 5th frame to save cost)
+                    depth_metric = None
+                    depth_run_counter += 1
+                    if depth_run_counter % 5 == 0 or not self._ekf.is_initialised:
+                        dm = _get_depth_model()
+                        if dm is not None:
+                            mask_np = res.get("mask_np")
+                            try:
+                                depth_rel = dm.infer_image(frame).astype(np.float32)
+                                res["depth_np"] = depth_rel
+                                if mask_np is not None:
+                                    depth_metric = self._depth_scaler.estimate_object_depth(
+                                        depth_rel, mask_np, percentile=50)
+                            except Exception as e:
+                                logger.warning("Depth inference failed: %s", e)
+
+                    # ── 4. EKF update ─────────────────────────────────
+                    if depth_metric is not None and depth_metric > 0.05:
+                        self._ekf.update(u, v, depth_metric)
+                        res["depth_metric"] = depth_metric
+                    elif self._ekf.is_initialised:
+                        self._ekf.update_2d_only(u, v)
+                        res["depth_metric"] = None
+                    else:
+                        default_z = self._pbvs.target_depth
+                        logger.info(f"EKF: seeding with default depth {default_z:.2f}m")
+                        self._ekf.update(u, v, default_z)
+                        res["depth_metric"] = None
+
+                # ── 5. Pack EKF state into result ─────────────────────
+                if self._ekf.is_initialised:
+                    res["ekf_position"] = self._ekf.position
+                    res["ekf_velocity"] = self._ekf.velocity
+                    res["ekf_pixel"] = self._ekf.predicted_pixel()
+                    res["ekf_uncertainty"] = self._ekf.position_uncertainty()
+
                 with self.data_lock:
                     self._result = res
+
                 if not self._models_ready.is_set():
-                    logger.info("Models ready — calibration may now proceed.")
+                    logger.info("Models ready, calibration may now proceed.")
                     self._models_ready.set()
-                if self.robot is not None and res.get("best_centroid") is not None:
-                    self.robot.servo_step(res["best_centroid"], frame.shape)
-            except Exception as e:
-                logger.error("Pipeline error: %s", e)
-                logger.exception("Details:")
+
+                # ── 6. Servo: PBVS if EKF is initialised, else IBVS ──
+                if self.robot is not None:
+                    ekf_pos = res.get("ekf_position")
+                    if ekf_pos is not None:
+                        self._servo_step_pbvs(ekf_pos)
+                    elif centroid is not None:
+                        self.robot.servo_step(centroid, frame.shape)
+
+                # ── 7. Log metrics to CSV ─────────────────────────────
+                iter_ms = (time.time() - iter_start) * 1000.0
+                self._frame_idx += 1
+                ekf_pos = res.get("ekf_position")
+                ekf_vel = res.get("ekf_velocity")
+                dx, dy, dz, err = self._last_servo_cmd
+
+                def _fmt_vec(vec, fmt=".6f"):
+                    """Format a 3-element vector, or return three empty strings."""
+                    if vec is not None:
+                        return [f"{v:{fmt}}" for v in vec[:3]]
+                    return ["", "", ""]
+
+                def _fmt_opt(key, fmt=None):
+                    """Format an optional scalar from res, or empty string."""
+                    val = res.get(key)
+                    if val is None:
+                        return ""
+                    return f"{val:{fmt}}" if fmt else str(val)
+
+                self._csv_writer.writerow([
+                    f"{iter_start:.6f}",
+                    self._frame_idx,
+                    f"{dt * 1000.0:.1f}",
+                    res.get("mode", "track"),
+                    centroid[0] if centroid else "",
+                    centroid[1] if centroid else "",
+                    *_fmt_vec(ekf_pos),
+                    *_fmt_vec(ekf_vel),
+                    _fmt_opt("ekf_uncertainty"),
+                    _fmt_opt("depth_metric"),
+                    f"{dx:.2f}", f"{dy:.2f}", f"{dz:.2f}",
+                    f"{err:.6f}",
+                    f"{iter_ms:.1f}",
+                ])
+                self._csv_file.flush()
+
+            except Exception:
+                logger.exception("Pipeline error")
                 time.sleep(1)
+
+        # Close CSV when loop exits (this thread owns the writer)
+        self._csv_file.close()
+        logger.info("Metrics saved: %s", self._csv_path)
+
+    def _servo_step_pbvs(self, ekf_position: np.ndarray):
+        """Position-based servo step using EKF-filtered 3D pose."""
+        if self.robot._arm is None or not self.robot.enabled:
+            return
+
+        now = time.time()
+        if now - self.robot._last_t < VS_RATE:
+            return
+        self.robot._last_t = now
+
+        v_robot, err_m = self._pbvs.compute_velocity(ekf_position)
+        if err_m < self._pbvs.dead_zone_m:
+            self._last_servo_vel = np.zeros(3)
+            self._last_servo_cmd = (0.0, 0.0, 0.0, err_m)
+            return
+
+        dt_step = VS_RATE
+        dx_mm = float(v_robot[0]) * dt_step * 1000.0
+        dy_mm = float(v_robot[1]) * dt_step * 1000.0
+        dz_mm = float(v_robot[2]) * dt_step * 1000.0
+
+        # Constant approach along robot X
+        dx_mm += VS_APPROACH
+
+        # Store velocity for egomotion compensation next predict step
+        self._last_servo_vel = v_robot
+        self._last_servo_cmd = (dx_mm, dy_mm, dz_mm, err_m)
+
+        with self.robot._lock:
+            try:
+                pos = self.robot._get_pos()
+                if pos is None:
+                    return
+                self.robot._arm.set_position(
+                    x=pos[0] + dx_mm, y=pos[1] + dy_mm,
+                    z=pos[2] + dz_mm,
+                    roll=pos[3], pitch=pos[4], yaw=pos[5],
+                    speed=VS_SPEED, mvacc=VS_MVACC, wait=True)
+                logger.info(
+                    f"PBVS: pos=({ekf_position[0]:.3f},"
+                    f"{ekf_position[1]:.3f},{ekf_position[2]:.3f})m  "
+                    f"err={err_m:.4f}m  "
+                    f"delta=({dx_mm:+.1f},{dy_mm:+.1f},{dz_mm:+.1f})mm")
+            except Exception as e:
+                logger.error("PBVS step failed: %s", e)
 
     # ── top-level dispatch ────────────────────────────────────────────
     def run(self):
@@ -426,7 +628,8 @@ class DINOv2CameraStreamer(threading.Thread):
         mat = sl.Mat()
         runtime_params = sl.RuntimeParameters()
 
-        threading.Thread(target=self._seg_loop, daemon=True).start()
+        self._seg_thread = threading.Thread(target=self._seg_loop, daemon=True)
+        self._seg_thread.start()
         if self.robot is not None and self.robot._arm is not None:
             threading.Thread(target=self._run_calibration, daemon=True).start()
 
@@ -467,23 +670,16 @@ class DINOv2CameraStreamer(threading.Thread):
                 cv2.imshow(win, rendered)
 
                 key = cv2.waitKey(1) & 0xFF
-                if key == ord("q"):
-                    self.stop_event.set()
+                if self._handle_key(key):
                     break
-                elif key == ord("v") and self.robot is not None:
-                    self.robot.enabled = not self.robot.enabled
-                    logger.info(f"Servo: {'ON' if self.robot.enabled else 'OFF'}")
-                elif key == ord("r"):
-                    self._tracker.reset(keep_anchor=True)
-                    logger.info("Tracker soft-reset (anchor kept)")
-                elif key == ord("R"):
-                    self._tracker.reset(keep_anchor=False)
-                    logger.info("Tracker FULL reset (anchor cleared)")
         finally:
             cam.close()
             if video_writer is not None:
                 video_writer.release()
-                logger.info(f"Recording saved: {anno_path}")
+                logger.info("Recording saved: %s", anno_path)
+            # Wait for _seg_loop to exit (it owns the CSV file)
+            if self._seg_thread is not None:
+                self._seg_thread.join(timeout=3)
             try:
                 cv2.destroyAllWindows()
             except Exception:
@@ -499,7 +695,8 @@ class DINOv2CameraStreamer(threading.Thread):
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 2560)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-        threading.Thread(target=self._seg_loop, daemon=True).start()
+        self._seg_thread = threading.Thread(target=self._seg_loop, daemon=True)
+        self._seg_thread.start()
         if self.robot is not None and self.robot._arm is not None:
             threading.Thread(target=self._run_calibration, daemon=True).start()
 
@@ -539,7 +736,7 @@ class DINOv2CameraStreamer(threading.Thread):
                         video_path, cv2.VideoWriter_fourcc(*"mp4v"),
                         30.0, (rw, rh))
                     if video_writer.isOpened():
-                        logger.info(f"Recording → {video_path}  ({rw}x{rh})")
+                        logger.info("Recording: %s (%dx%d)", video_path, rw, rh)
                     else:
                         video_writer.release()
                         video_writer = None
@@ -549,22 +746,14 @@ class DINOv2CameraStreamer(threading.Thread):
                 cv2.imshow(win, rendered)
 
                 key = cv2.waitKey(1) & 0xFF
-                if key == ord("q"):
-                    self.stop_event.set()
+                if self._handle_key(key):
                     break
-                elif key == ord("v") and self.robot is not None:
-                    self.robot.enabled = not self.robot.enabled
-                    logger.info(f"Servo: {'ON' if self.robot.enabled else 'OFF'}")
-                elif key == ord("r"):
-                    self._tracker.reset(keep_anchor=True)
-                    logger.info("Tracker soft-reset (anchor kept)")
-                elif key == ord("R"):
-                    self._tracker.reset(keep_anchor=False)
-                    logger.info("Tracker FULL reset (anchor cleared)")
         finally:
             cap.release()
             if video_writer is not None:
                 video_writer.release()
+            if self._seg_thread is not None:
+                self._seg_thread.join(timeout=3)
             try:
                 cv2.destroyAllWindows()
             except Exception:
@@ -608,6 +797,18 @@ class DINOv2CameraStreamer(threading.Thread):
             cv2.putText(display, f"err={err:.0f}px", (cx + 10, cy - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
 
+        # EKF filtered centroid (blue cross, distinct from raw red cross)
+        ekf_pixel = res.get("ekf_pixel")
+        if ekf_pixel is not None:
+            eu, ev = ekf_pixel
+            ekf_unc = res.get("ekf_uncertainty")
+            if ekf_unc is not None:
+                radius = max(5, int(ekf_unc * 500))
+                cv2.circle(display, (eu, ev), radius,
+                           (255, 100, 100), 1, cv2.LINE_AA)
+            cv2.drawMarker(display, (eu, ev), (255, 50, 50),
+                           cv2.MARKER_TILTED_CROSS, 18, 2)
+
         # Status HUD
         status_lines = [
             f"anchor: {'LOCKED' if self._tracker.anchor_locked else 'no'}",
@@ -616,6 +817,19 @@ class DINOv2CameraStreamer(threading.Thread):
         if self.robot is not None:
             status_lines.append(f"servo: {'ON' if self.robot.enabled else 'OFF'}")
             status_lines.append(f"cal: {self.robot.cal_status}")
+
+        # EKF HUD
+        ekf_pos = res.get("ekf_position")
+        if ekf_pos is not None:
+            status_lines.append(
+                f"EKF: X={ekf_pos[0]:.3f} Y={ekf_pos[1]:.3f} Z={ekf_pos[2]:.3f}m")
+        depth_m = res.get("depth_metric")
+        if depth_m is not None:
+            status_lines.append(f"depth: {depth_m:.3f}m")
+        ekf_unc = res.get("ekf_uncertainty")
+        if ekf_unc is not None:
+            status_lines.append(f"unc: {ekf_unc:.4f}")
+
         for i, line in enumerate(status_lines):
             cv2.putText(display, line, (10, 25 + i * 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
@@ -679,6 +893,25 @@ if __name__ == "__main__":
     else:
         logger.info("Robot disabled (--no-robot)")
 
+    # EKF + PBVS setup
+    # Camera intrinsics: approximate ZED Mini at 720p
+    cam_intrinsics = CameraIntrinsics(fx=700.0, fy=700.0, cx=640.0, cy=360.0)
+    ekf = PoseEKF(
+        cam_intrinsics,
+        process_noise_pos=0.01,
+        process_noise_vel=0.1,
+        meas_noise_uv=6.0,
+        meas_noise_z=0.10,
+    )
+    pbvs = PBVSController(
+        gain=0.4,
+        target_depth=0.35,
+        max_vel=0.015,
+        dead_zone_m=0.008,
+    )
+    depth_scaler = DepthScaler(default_scale=0.001)
+    logger.info("EKF + PBVS initialised")
+
     # Start camera streamer
     stop_ev = threading.Event()
     cam_thread = DINOv2CameraStreamer(
@@ -686,6 +919,9 @@ if __name__ == "__main__":
         stop_event=stop_ev,
         robot=robot,
         ref_model=ref_model,
+        ekf=ekf,
+        pbvs=pbvs,
+        depth_scaler=depth_scaler,
         use_pyzed=not args.no_pyzed,
     )
     cam_thread.start()

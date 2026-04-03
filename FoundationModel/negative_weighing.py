@@ -47,6 +47,16 @@ NEG_POINT_MARGIN_PX   = 30       # erosion margin for safe negative zone
 REDETECT_INTERVAL     = 30       # re-run detector every N frames to prevent drift
 IOU_DRIFT_THRESH      = 0.35     # if mask IoU with previous < this, reset tracker
 
+# ── Camera / recording parameters ────────────────────────────────────
+MIN_RECORDING_DIM     = 480      # minimum frame dimension for video recording
+ZED_RESOLUTION        = "HD720"  # ZED camera resolution preset
+
+try:
+    import pyzed.sl as _sl
+    PYZED_AVAILABLE = True
+except ImportError:
+    PYZED_AVAILABLE = False
+
 try:
     import torch
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -151,6 +161,27 @@ def _mask_iou(m1: np.ndarray, m2: np.ndarray) -> float:
     return inter / (union + 1e-6)
 
 
+class ZedUndistorter:
+    """Lens distortion correction for ZED stereo camera side images."""
+
+    def __init__(self, camera_matrix: np.ndarray, dist_coeffs: np.ndarray,
+                 w: int, h: int):
+        self.map1, self.map2 = cv2.initUndistortRectifyMap(
+            camera_matrix, dist_coeffs, None, camera_matrix, (w, h), cv2.CV_32FC1)
+
+    @classmethod
+    def from_frame_size(cls, w: int, h: int):
+        """Build with approximate ZED Mini intrinsics for the given resolution."""
+        fx = fy = 700.0 * (w / 1280.0)
+        cx, cy = w / 2.0, h / 2.0
+        K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+        dist = np.zeros(5, dtype=np.float64)
+        return cls(K, dist, w, h)
+
+    def undistort(self, frame: np.ndarray) -> np.ndarray:
+        return cv2.remap(frame, self.map1, self.map2, cv2.INTER_LINEAR)
+
+
 # ═════════════════════════════════════════════════════════════════════
 #  MaskTracker — temporal state for SAM2 mask propagation
 # ═════════════════════════════════════════════════════════════════════
@@ -176,13 +207,23 @@ class MaskTracker:
         self.frame_count:  int               = 0
         self.mask_history: list              = []
 
+        # Anchor state: a stable mask/logits snapshot used as fallback
+        # when the tracker drifts or loses the target.
+        self.anchor_locked: bool             = False
+        self.anchor_logits: np.ndarray | None = None
+        self.anchor_mask:   np.ndarray | None = None
+
     # ── housekeeping ─────────────────────────────────────────────────
-    def reset(self):
+    def reset(self, keep_anchor: bool = False):
         self.prev_logits   = None
         self.prev_mask     = None
         self.prev_centroid = None
         self.frame_count   = 0
         self.mask_history.clear()
+        if not keep_anchor:
+            self.anchor_locked = False
+            self.anchor_logits = None
+            self.anchor_mask   = None
 
     def update(self, mask_np: np.ndarray | None,
                logits: np.ndarray | None,
@@ -195,6 +236,11 @@ class MaskTracker:
             self.mask_history.append(mask_np.copy())
             if len(self.mask_history) > TRACKER_MAX_HISTORY:
                 self.mask_history.pop(0)
+            # Lock anchor on first good mask if not already locked
+            if not self.anchor_locked and logits is not None:
+                self.anchor_logits = logits.copy()
+                self.anchor_mask   = mask_np.copy()
+                self.anchor_locked = True
         else:
             # Lost the target — start winding down
             self.frame_count = max(0, self.frame_count - 1)
@@ -252,7 +298,7 @@ class MaskTracker:
         if self.prev_centroid is not None:
             pts.append(list(self.prev_centroid))
 
-        if n > len(pts) and self.prev_mask is not None:
+        if n > len(pts):
             mr = self.prev_mask if self.prev_mask.shape[:2] == (h, w) else \
                 cv2.resize(self.prev_mask, (w, h),
                            interpolation=cv2.INTER_NEAREST)
@@ -583,12 +629,9 @@ def run_pipeline(image_bgr: np.ndarray, prompt: str,
     h, w = image_bgr.shape[:2]
 
     # ── Decide whether to run the detector this frame ────────────────
-    need_detection = True
-    if tracker is not None and tracker.prev_logits is not None:
-        # We have a propagated mask — skip detection unless it's time
-        # to re-anchor or the track looks bad
-        if tracker.frame_count % REDETECT_INTERVAL != 0:
-            need_detection = False
+    has_track = tracker is not None and tracker.prev_logits is not None
+    periodic_redetect = has_track and tracker.frame_count % REDETECT_INTERVAL == 0
+    need_detection = not has_track or periodic_redetect
 
     # ── Step 1: Detect bounding box (GDino or OWLv2) ────────────────
     box_np = None
@@ -608,6 +651,7 @@ def run_pipeline(image_bgr: np.ndarray, prompt: str,
                   f"@ {box_np.astype(int)}  (top of {len(dets)})")
 
     # ── Step 2: SAM2 segmentation with mask propagation ──────────────
+    tracker_logits = None
     try:
         pred = _get_sam2()
         rgb  = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
@@ -617,27 +661,23 @@ def run_pipeline(image_bgr: np.ndarray, prompt: str,
         point_coords = []       # Nx2
         point_labels = []       # N   (1=pos, 0=neg)
 
-        # Positive points from previous mask centroid
         if tracker is not None:
             pos_pts = tracker.sample_positive_points(h, w, n=1)
             if pos_pts is not None:
-                for pt in pos_pts:
-                    point_coords.append(pt)
-                    point_labels.append(1)
+                point_coords.extend(pos_pts)
+                point_labels.extend([1] * len(pos_pts))
 
-        # Negative points (background) after warm-up
-        if tracker is not None:
             neg_pts = tracker.sample_negative_points(h, w, NEG_POINT_COUNT)
             if neg_pts is not None:
-                for pt in neg_pts:
-                    point_coords.append(pt)
-                    point_labels.append(0)
+                point_coords.extend(neg_pts)
+                point_labels.extend([0] * len(neg_pts))
                 print(f"SAM2: +{len(pos_pts) if pos_pts is not None else 0} pos, "
                       f"+{len(neg_pts)} neg point prompts")
 
         # Prepare SAM2 predict kwargs
+        has_prior = tracker is not None and tracker.prev_logits is not None
         sam_kwargs = dict(
-            multimask_output=True,
+            multimask_output=not has_prior,
             return_logits=True,
         )
 
@@ -649,16 +689,13 @@ def run_pipeline(image_bgr: np.ndarray, prompt: str,
             sam_kwargs["point_labels"] = np.array(point_labels, dtype=np.int32)
 
         # Feed previous logits for temporal propagation
-        if tracker is not None and tracker.prev_logits is not None:
+        if has_prior:
             sam_kwargs["mask_input"] = tracker.prev_logits
-            # When we have a prior, single-mask output is more stable
-            sam_kwargs["multimask_output"] = False
 
         # --- Run SAM2 predict ----------------------------------------
         masks, scores_sam, logits = pred.predict(**sam_kwargs)
 
         if masks is not None and len(masks) > 0:
-            # Pick the best mask by SAM2 score
             best_idx = int(np.argmax(scores_sam))
             mask_out = (masks[best_idx] > 0).astype(np.uint8) * 255
 
@@ -666,30 +703,21 @@ def run_pipeline(image_bgr: np.ndarray, prompt: str,
             if tracker is not None and tracker.prev_mask is not None:
                 iou = _mask_iou(mask_out, tracker.prev_mask)
                 if iou < IOU_DRIFT_THRESH and not need_detection:
-                    print(f"SAM2: mask IoU={iou:.2f} < {IOU_DRIFT_THRESH} — "
+                    print(f"SAM2: mask IoU={iou:.2f} < {IOU_DRIFT_THRESH}, "
                           f"probable drift, resetting tracker")
-                    tracker.reset()
-                    # Re-run with detection to re-anchor
+                    tracker.reset(keep_anchor=True)
                     return run_pipeline(image_bgr, prompt, tracker)
 
             res["mask_np"] = mask_out
-
-            # Store low-res logits for next frame (keep batch dim: 1×H×W)
-            low_logits = logits[best_idx: best_idx + 1]  # (1, 256, 256)
-            if tracker is not None:
-                tracker_logits = low_logits
-            else:
-                tracker_logits = None
+            tracker_logits = logits[best_idx:best_idx + 1]  # (1, 256, 256)
 
             print(f"SAM2: mask obtained (score={scores_sam[best_idx]:.3f})")
         else:
-            tracker_logits = None
             print("SAM2: no mask returned")
     except Exception as e:
         import traceback
         print("SAM2 failed:", e)
         traceback.print_exc()
-        tracker_logits = None
 
     # ── Step 3: Depth (kept for inset visualisation) ─────────────────
     dm = _get_depth_model()
@@ -700,20 +728,19 @@ def run_pipeline(image_bgr: np.ndarray, prompt: str,
             print("Depth inference failed:", e)
 
     # ── Step 4: Grasp point — robust centroid → bbox fallback ────────
+    centroid = None
     if res["mask_np"] is not None:
-        mc = _robust_centroid(res["mask_np"])
-        if mc is not None:
-            res["best_centroid"] = mc
-            print(f"Grasp point: robust centroid {mc}")
-        elif res["gdino_box"] is not None:
-            x1, y1, x2, y2 = res["gdino_box"]
-            res["best_centroid"] = (int((x1 + x2) / 2), int((y1 + y2) / 2))
-            print(f"Grasp point: bbox centre {res['best_centroid']} "
-                  f"(centroid failed)")
-    elif res["gdino_box"] is not None:
+        centroid = _robust_centroid(res["mask_np"])
+        if centroid is not None:
+            print(f"Grasp point: robust centroid {centroid}")
+
+    if centroid is None and res["gdino_box"] is not None:
         x1, y1, x2, y2 = res["gdino_box"]
-        res["best_centroid"] = (int((x1 + x2) / 2), int((y1 + y2) / 2))
-        print(f"Grasp point: bbox centre {res['best_centroid']} (no SAM2 mask)")
+        centroid = (int((x1 + x2) / 2), int((y1 + y2) / 2))
+        reason = "centroid failed" if res["mask_np"] is not None else "no SAM2 mask"
+        print(f"Grasp point: bbox centre {centroid} ({reason})")
+
+    res["best_centroid"] = centroid
 
     # ── Step 5: Update tracker ───────────────────────────────────────
     if tracker is not None:

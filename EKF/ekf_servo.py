@@ -99,6 +99,12 @@ class PoseEKF:
     def is_initialised(self):
         return self._initialised
 
+    def reset(self):
+        """Clear state so the filter must be re-initialised."""
+        self.x = np.zeros(self.DIM_STATE)
+        self.P = np.eye(self.DIM_STATE)
+        self._initialised = False
+
     # ─────────────────────────────────────────────────────────────
     #  Initialisation from first measurement
     # ─────────────────────────────────────────────────────────────
