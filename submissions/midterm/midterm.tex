@@ -6,7 +6,7 @@
 
 %\documentclass[a4paper, 10pt, conference]{ieeeconf}      % Use this line for a4 paper
 
-\IEEEoverridecommandlockouts                              % This command is only needed if 
+\IEEEoverridecommandlockouts                              % This command is only needed if
                                                           % you want to use the \thanks command
 
 \overrideIEEEmargins                                      % Needed to meet printer requirements.
@@ -29,14 +29,10 @@
 \usepackage{times} % assumes new font selection scheme installed
 \usepackage{amsmath} % assumes amsmath package installed
 \usepackage{amssymb}  % assumes amsmath package installed
-\usepackage{xcolor}
-
-\newcommand{\aku}[1]{\textcolor{blue}{AS: #1}}
 
 \title{\LARGE \bf
 FoundationPose vs.\ EKF-Based Stereo Pose Tracking for Manipulator Visual Servoing
 }
-
 \author{Akanksha Singal and Sidd Vohra\\
 Carnegie Mellon University\\
 {\tt\small \{asingal2, svohra\}@andrew.cmu.edu}
@@ -48,204 +44,243 @@ Carnegie Mellon University\\
 \thispagestyle{empty}
 \pagestyle{empty}
 
-
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \begin{abstract}
-Robust visual servoing is critical for autonomous manipulation in unstructured environments such as warehouses, homes etc. Visual servoing requires accurate estimation of the relative pose between the robot end-effector and the target grasp point. We compare two fundamentally different approaches to 6DoF pose estimation in an iterative visual servoing loop: FoundationPose, a learning-based method that produces per-frame pose estimates from RGB-D input, and an Extended Kalman Filter (EKF) based pose tracker that maintains a probabilistic belief over the camera state across time. We evaluate both methods in simulation, measuring convergence, accuracy, robustness to noise, and runtime in the context of iterative pose-based visual servoing. Our goal is to characterize the trade-offs between a memoryless, high-capacity model and a stateful, uncertainty-aware classical estimator when pose errors compound over a closed-loop trajectory.
+Robust visual servoing is critical for autonomous manipulation in unstructured environments such as warehouses and homes. Visual servoing requires accurate estimation of the relative pose between the robot end-effector and the target grasp point. We compare two approaches to pose estimation in an iterative visual servoing loop: a learning-based perception front-end (DINOv2 + SAM2 + Depth Anything V2) that produces per-frame observations, and an Extended Kalman Filter (EKF) that fuses those observations into a temporally filtered 3D position estimate. We integrate both into a unified pipeline on an xArm manipulator with a ZED Mini camera, comparing an EKF-based position-based visual servoing (PBVS) controller against a baseline image-based visual servoing (IBVS) system. We describe our system architecture, the EKF formulation, and report on implementation progress toward a quantitative evaluation of closed-loop servoing performance.
 \end{abstract}
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% \section{INTRODUCTION \& IMPACT}
+\section{INTRODUCTION}
 
-% Reliable visual servoing is fundamental for autonomous robotic manipulation in applications such as warehouse automation, household robotics, and surgical. Classical visual servo pipelines depend heavily on accurate pose estimation from geometric pipelines that often degrade in low-texture, cluttered, or partially occluded environments. This project investigates stereo pose tracking methods for visual servoing, combining classical state-estimation approaches (EKF-based tracking) with modern learning-based pose estimators (e.g., FoundationPose). The outcome will provide insights into the trade-offs between model-based and learning-based perception for closed-loop control and contribute toward more robust manipulation systems in unstructured environments.
+Visual servoing uses visual feedback to guide a robot toward a desired configuration. In applications like warehouse pick-and-place and household manipulation, the robot must localize a target object and iteratively correct its end-effector pose until it reaches a grasp point. The quality of this process depends directly on how well the perception system estimates the object's pose at each control iteration. Errors in pose estimation do not simply add noise to the trajectory; they compound over time through the control loop, and can cause the robot to oscillate, overshoot, or diverge entirely from the desired grasp point.
 
-% Visual servoing uses visual feedback to control a robot's motion toward a goal pose. Pose-based visual servoing (PBVS) relies on accurate 6DoF camera pose estimation at each iteration. Errors in pose estimation propagate through the control loop, potentially causing divergence or inefficient trajectories.
+There are two classical formulations for visual servoing~\cite{chaumette2006}. Image-based visual servoing (IBVS) works entirely in pixel coordinates, mapping the error between current and desired image features to robot velocities through an image Jacobian. Because it avoids explicit 3D reconstruction, IBVS is simple and robust to calibration errors. However, IBVS can produce unintuitive Cartesian trajectories, struggles with large displacements, and has no way to reason about depth or distance to the target. Position-based visual servoing (PBVS) reconstructs the 3D pose of the target in the camera frame and computes a Cartesian velocity command that drives the object to a desired position. PBVS gives straight-line trajectories in Cartesian space, but its performance is tied directly to the accuracy of the underlying 3D pose estimate.
 
-% Recent foundation models such as FoundationPose~\cite{foundationpose} achieve strong single-frame pose accuracy on standard benchmarks. However, these models are memoryless: each frame is processed independently with no temporal context. In contrast, the Extended Kalman Filter (EKF) maintains a state estimate and covariance across time, naturally handling noisy measurements through sequential Bayesian estimation.
+Recent foundation models for perception open up new possibilities for building PBVS systems that work on novel objects without task-specific training. DINOv2~\cite{dinov2} provides dense, semantically rich patch-level features from a self-supervised Vision Transformer that transfer well across visual domains. SAM2~\cite{sam2} produces high-quality segmentation masks from minimal prompts (a bounding box or a few points) and supports temporal mask propagation across video frames via logit passing. Depth Anything V2~\cite{depthanything} estimates monocular depth from a single RGB image, providing relative depth that can be calibrated to metric scale. Together, these three models can localize, segment, and estimate the depth of an arbitrary object given only a single reference photo.
 
-% This project provides a systematic comparison of these two paradigms in a closed-loop visual servoing setting, where the key question is not just per-frame accuracy but how well each method supports iterative convergence to a goal pose under realistic conditions.
+However, foundation model outputs are inherently per-frame: each image is processed independently with no temporal context. In a servoing loop where the robot is actively moving and the scene is changing, this independence means that frame-to-frame jitter in the detection centroid or depth estimate feeds directly into the control commands. A noisy centroid at one frame causes a jerky velocity command, which moves the robot, which changes the image, which produces another noisy centroid. In practice this can produce oscillatory behavior near the goal or slow convergence.
+
+The Extended Kalman Filter (EKF)~\cite{thrun2005} provides a principled framework for smoothing noisy per-frame observations over time. By maintaining a probabilistic state estimate (position and velocity) along with a covariance matrix that tracks uncertainty, the EKF can dampen measurement noise, propagate predictions forward during brief tracking failures, and provide the controller with uncertainty-aware estimates. The EKF also provides a natural mechanism for incorporating the robot's own motion (egomotion compensation), since the camera is mounted on the moving end-effector.
+
+In this project, we build a complete visual servoing system that combines foundation model perception with EKF-based state estimation, and compare it against a direct IBVS baseline that uses raw per-frame detections. Both systems run on real hardware (xArm manipulator, ZED Mini camera) with per-frame metrics logging for quantitative evaluation. Our goal is to characterize the practical trade-offs: does the EKF's temporal filtering and uncertainty tracking provide meaningful improvements in convergence speed, trajectory smoothness, and final accuracy compared to feeding raw per-frame observations directly to a controller?
 
 
-% Most evaluations of pose estimation methods focus on single-frame accuracy on static benchmarks. In practice, pose estimates are consumed by downstream control loops where errors accumulate. Understanding the behavior of learning-based vs.\ filtering-based methods in this setting has direct implications for practitioners designing visual servoing systems. Specifically, we aim to answer: does the EKF's uncertainty tracking and temporal smoothing offer meaningful advantages over a powerful per-frame estimator, and under what degraded conditions does one approach fail before the other?
-\section{INTRODUCTION \& IMPACT}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{RELATED WORK}
 
-Reliable visual servoing is fundamental to autonomous robotic manipulation in applications such as warehouse automation, household robotics, and surgical assistance. Classical visual servo pipelines rely heavily on accurate pose estimation obtained from geometric reconstruction pipelines. However, these pipelines often degrade in low-texture, cluttered, or partially occluded environments, leading to unstable or inefficient closed-loop behavior. This project investigates stereo pose tracking methods for visual servoing by comparing classical state-estimation approaches (EKF-based tracking) with modern learning-based pose estimators (e.g., FoundationPose). The goal is to understand how perception design choices impact downstream control performance and to advance more robust manipulation systems for unstructured environments.
+\textbf{Visual servoing.}
+Chaumette and Hutchinson~\cite{chaumette2006} provide a comprehensive treatment of visual servo control, covering both IBVS and PBVS formulations, their stability properties, and the interaction matrix (image Jacobian) that relates image feature velocities to camera velocities. Their framework underpins most modern visual servoing systems. A key insight from their analysis is that IBVS is locally stable around the desired configuration but can fail for large displacements, while PBVS provides global convergence guarantees but is sensitive to pose estimation errors.
 
-Visual servoing uses visual feedback to regulate robot motion toward a desired goal pose. In particular, pose-based visual servoing (PBVS) depends critically on accurate 6-DoF pose estimates at every control iteration. Errors in pose estimation propagate directly through the control loop and can result in slow convergence, oscillatory behavior, or even divergence. Consequently, evaluating perception modules solely based on single-frame pose accuracy is insufficient for understanding their effectiveness in closed-loop robotic systems.
+\textbf{6-DoF pose estimation.}
+FoundationPose~\cite{foundationpose} achieves state-of-the-art 6-DoF pose estimation and tracking from RGB-D input paired with either a CAD model or a small set of reference images. It has been benchmarked extensively on the BOP and YCB-Video datasets. However, it operates per-frame without temporal filtering, and its reliance on a known 3D model or RGB-D input limits applicability in settings with novel objects or monocular cameras.
 
-Recent foundation models such as FoundationPose~\cite{foundationpose} demonstrate strong single-frame pose accuracy on standard benchmarks. However, these models are inherently memoryless, processing each frame independently without leveraging temporal consistency. In contrast, the Extended Kalman Filter (EKF) maintains a recursive state estimate and covariance over time, enabling principled uncertainty handling and temporal smoothing through sequential Bayesian estimation.
+\textbf{EKF for visual tracking.}
+The use of Kalman filtering for visual tracking has a long history~\cite{thrun2005}. The standard approach is to maintain a state vector (typically position and velocity in 3D) and update it with measurements derived from image features. The EKF linearizes the nonlinear measurement model (pinhole projection) around the current estimate at each step. Tao et al.~\cite{tao2026perceptioncontrol} recently proposed a perception-control coupled approach for visual servoing of textureless objects using a keypoint-based EKF. Their work is close in spirit to ours, but they use learned keypoint detectors as the measurement source, whereas we use foundation model features (DINOv2 + SAM2).
 
-This project provides a systematic closed-loop comparison of these two paradigms for stereo visual servoing. Rather than focusing only on per-frame pose accuracy, we evaluate how each approach supports iterative convergence to a desired goal pose under realistic operating conditions. Most existing evaluations of pose estimation methods emphasize static, open-loop benchmarks, whereas in practice pose estimates are consumed by downstream controllers where errors compound over time.
+\textbf{Foundation models for robotics perception.}
+DINOv2~\cite{dinov2} has been shown to produce patch-level features that transfer across visual domains for matching, retrieval, and segmentation tasks. SAM2~\cite{sam2} extends the Segment Anything model with video-level mask propagation, enabling real-time tracking by passing low-resolution logits between consecutive frames. Depth Anything V2~\cite{depthanything} provides monocular depth estimation that, while producing relative rather than metric depth, can be converted to approximate metric scale through a simple affine calibration. These models have individually been applied to robotic tasks, but to our knowledge, no prior work has combined all three into an integrated perception front-end feeding an EKF for closed-loop visual servoing on real hardware.
 
-Understanding the relative strengths of learning-based versus filtering-based pose tracking in this closed-loop setting has direct implications for practitioners designing visual servo systems. Specifically, we aim to answer the following question: \emph{does the EKF's temporal filtering and uncertainty propagation provide meaningful advantages over a high-capacity per-frame pose estimator, and under what degraded visual conditions does one approach fail before the other?}
 
-\section{NOVELTY}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{THEORETICAL BACKGROUND}
 
-While FoundationPose has been benchmarked extensively on datasets like BOP and YCB-Video, we are not aware of a direct comparison with EKF-based tracking in an iterative servoing loop. 
-% The novel contribution of this project is evaluating these methods not on static pose accuracy but on closed-loop servoing performance, including convergence rate, path efficiency, and robustness under systematic perturbations (noise, occlusion, lighting). This comparison highlights trade-offs that do not surface in standard benchmarking.
-The key novelty of this project lies in evaluating stereo pose tracking methods through the lens of control performance rather than standalone perception accuracy. Specifically, we integrate both EKF-based stereo tracking and FoundationPose into a unified pose-based visual servoing (PBVS) pipeline and assess their impact on iterative convergence to a goal pose.
+\subsection{Pinhole Camera Model}
+A point $\mathbf{p} = [X, Y, Z]^T$ in the camera frame projects to pixel coordinates $(u, v)$ via:
+\begin{equation}
+u = f_x \frac{X}{Z} + c_x, \qquad v = f_y \frac{Y}{Z} + c_y
+\label{eq:projection}
+\end{equation}
+where $f_x, f_y$ are the focal lengths in pixels and $(c_x, c_y)$ is the principal point. The inverse operation (backprojection) given a known depth $Z$ recovers the 3D point: $X = (u - c_x) Z / f_x$, \ $Y = (v - c_y) Z / f_y$.
 
-We evaluate performance using control-relevant metrics including convergence rate, time to convergence, path efficiency, and robustness under systematic degradations such as measurement noise, partial occlusion, and lighting variation. This study exposes perception–control trade-offs that are not visible in standard pose estimation benchmarks and provides practical guidance for designing robust visual servoing systems.
+\subsection{Extended Kalman Filter}
+We use an EKF to track the target object's 3D position and velocity in the camera frame. The state vector is:
+\begin{equation}
+\mathbf{x} = [X, \; Y, \; Z, \; \dot{X}, \; \dot{Y}, \; \dot{Z}]^T \in \mathbb{R}^6
+\end{equation}
+where $(X, Y, Z)$ is the object position in metres and $(\dot{X}, \dot{Y}, \dot{Z})$ is velocity in m/s, both in the camera coordinate frame.
 
-\section{METHODS}
+\textbf{Process model.}
+We assume constant-velocity dynamics with egomotion compensation. Given time step $\Delta t$ and the robot end-effector velocity $\mathbf{v}_{\text{robot}}$ expressed in the camera frame:
+\begin{equation}
+\mathbf{x}_{k|k-1} = \mathbf{F} \, \mathbf{x}_{k-1} - \begin{bmatrix} \mathbf{v}_{\text{robot}} \, \Delta t \\ \mathbf{0}_3 \end{bmatrix} + \mathbf{w}_k
+\label{eq:process}
+\end{equation}
+where $\mathbf{w}_k \sim \mathcal{N}(\mathbf{0}, \mathbf{Q} \Delta t)$ is process noise scaled by the time step, and the state transition matrix is:
+\begin{equation}
+\mathbf{F} = \begin{bmatrix} \mathbf{I}_3 & \Delta t \, \mathbf{I}_3 \\ \mathbf{0}_3 & \mathbf{I}_3 \end{bmatrix} \in \mathbb{R}^{6 \times 6}
+\end{equation}
+The egomotion subtraction accounts for the fact that when the camera (mounted on the end-effector) moves in direction $+X$, the object appears to shift in direction $-X$ in the camera frame. Without this compensation, the EKF would interpret robot-induced image motion as object motion and produce incorrect velocity estimates. The covariance prediction follows the standard form: $\mathbf{P}_{k|k-1} = \mathbf{F} \mathbf{P}_{k-1} \mathbf{F}^T + \mathbf{Q} \Delta t$.
 
-We will use the following methods and concepts from the course:
+\textbf{Measurement model.}
+The measurement vector combines the 2D pixel centroid of the detected object with a metric depth estimate:
+\begin{equation}
+\mathbf{z} = \begin{bmatrix} u \\ v \\ Z \end{bmatrix}, \qquad
+h(\mathbf{x}) = \begin{bmatrix} f_x X/Z + c_x \\ f_y Y/Z + c_y \\ Z \end{bmatrix}
+\end{equation}
+This is the standard pinhole projection (Eq.~\ref{eq:projection}) augmented with a direct depth observation. The measurement Jacobian $\mathbf{H} = \partial h / \partial \mathbf{x}$ evaluated at the current state estimate is:
+\begin{equation}
+\mathbf{H} = \begin{bmatrix}
+f_x/Z & 0 & -f_x X/Z^2 & 0 & 0 & 0 \\[3pt]
+0 & f_y/Z & -f_y Y/Z^2 & 0 & 0 & 0 \\[3pt]
+0 & 0 & 1 & 0 & 0 & 0
+\end{bmatrix}
+\label{eq:jacobian}
+\end{equation}
+The velocity states $(\dot{X}, \dot{Y}, \dot{Z})$ do not appear directly in the measurement model, so the rightmost three columns of $\mathbf{H}$ are zero. The velocity is estimated indirectly: the process model couples position and velocity, and the position corrections from each measurement update propagate through the covariance to constrain the velocity as well.
 
-\textbf{Extended Kalman Filter:} We implement an EKF for 6DoF pose tracking. The state vector contains the camera pose (position and orientation). The motion model predicts the next pose given the servoing control command. The measurement model incorporates depth-based or feature-based observations to correct the predicted state. The EKF linearizes both models around the current estimate and propagates the covariance matrix, providing uncertainty estimates alongside pose estimates.
+\textbf{Update step.}
+Given a measurement $\mathbf{z}_k$ with noise covariance $\mathbf{R} = \text{diag}(\sigma_u^2, \sigma_v^2, \sigma_Z^2)$, we compute:
+\begin{align}
+\mathbf{y}_k &= \mathbf{z}_k - h(\mathbf{x}_{k|k-1}) & \text{(innovation)} \label{eq:innovation} \\
+\mathbf{S}_k &= \mathbf{H} \, \mathbf{P}_{k|k-1} \, \mathbf{H}^T + \mathbf{R} & \text{(innovation covariance)} \\
+\mathbf{K}_k &= \mathbf{P}_{k|k-1} \, \mathbf{H}^T \, \mathbf{S}_k^{-1} & \text{(Kalman gain)} \\
+\mathbf{x}_k &= \mathbf{x}_{k|k-1} + \mathbf{K}_k \, \mathbf{y}_k & \text{(state update)}
+\end{align}
+For the covariance update, we use the Joseph form rather than the standard $\mathbf{P}_k = (\mathbf{I} - \mathbf{K}_k \mathbf{H}) \mathbf{P}_{k|k-1}$, because the Joseph form is algebraically equivalent but numerically more stable when the Kalman gain is large:
+\begin{equation}
+\mathbf{P}_k = (\mathbf{I} - \mathbf{K}_k \mathbf{H}) \, \mathbf{P}_{k|k-1} \, (\mathbf{I} - \mathbf{K}_k \mathbf{H})^T + \mathbf{K}_k \, \mathbf{R} \, \mathbf{K}_k^T
+\label{eq:joseph}
+\end{equation}
 
-\textbf{Rigid Body Transformations and Rotations:} Both methods require reasoning about SE(3) transformations. We will represent rotations carefully using rotation matrices and handle the manifold structure when computing pose errors and control commands.
+\textbf{2D-only update.}
+Running the depth model on every frame is expensive. On frames where we skip depth estimation, we perform a partial update using only the pixel centroid $(u, v)$. This uses the top two rows of $\mathbf{H}$ (a $2 \times 6$ matrix) and the corresponding $2 \times 2$ block of $\mathbf{R}$. The 2D-only update still constrains the lateral position ($X, Y$) while allowing the depth $Z$ to evolve under the process model.
 
-\textbf{Least-Squares Pose Estimation:} The EKF measurement update can be understood as a sequential least-squares problem. We will use this connection to analyze the estimator's behavior.
+\subsection{Control Laws}
 
-\textbf{Covariance and Uncertainty:} The EKF produces covariance estimates that characterize pose uncertainty. We will analyze how this uncertainty evolves during servoing and compare it against empirical errors from FoundationPose.
+\textbf{IBVS baseline.}
+The pixel error $\mathbf{e} = [e_x, e_y]^T$ between the detected object centroid and the image center is mapped to robot end-effector displacements through a $2 \times 2$ image Jacobian $\mathbf{J}$ (with units px/mm):
+\begin{equation}
+\begin{bmatrix} \Delta y \\ \Delta z \end{bmatrix}_{\text{robot}} = -\alpha \, \mathbf{J}^{-1} \, \mathbf{e}
+\end{equation}
+where $\alpha$ is a proportional gain. We estimate $\mathbf{J}$ through an online optical-flow calibration procedure: the robot makes small known displacements in $Y$ and $Z$, and we measure the resulting pixel shifts using Lucas-Kanade feature tracking, giving two columns of $\mathbf{J}$. A constant forward approach velocity is added along the robot $X$ axis.
 
-\textbf{State-Space Modeling of Nonlinear Systems:} The visual servoing pipeline is formulated in a nonlinear state-space framework. We explicitly model the system dynamics and measurement processes required by the EKF, enabling principled recursive estimation and analysis of error propagation in closed loop.
+\textbf{PBVS (EKF-based).}
+The EKF-filtered 3D position $\mathbf{t}_{\text{obj}}$ is compared against a desired position $\mathbf{t}^* = [0, 0, Z^*]^T$ (centered on the optical axis at a target depth $Z^*$):
+\begin{equation}
+\mathbf{v}_{\text{cam}} = -\lambda \, (\mathbf{t}_{\text{obj}} - \mathbf{t}^*)
+\label{eq:pbvs}
+\end{equation}
+where $\lambda$ is a proportional gain. The velocity is clamped per-axis for safety, then transformed from the camera frame to the robot base frame via the camera-to-robot rotation $\mathbf{R}_{\text{cam} \to \text{robot}}$ before being sent to the robot.
 
-\section{METRICS FOR SUCCESS}
 
-We will evaluate both methods on:
-\begin{enumerate}
-    \item \textbf{Final pose error:} Translation (cm) and rotation (degrees) error between the achieved and goal poses after the servoing loop terminates.
-    \item \textbf{Convergence rate:} Number of iterations (or time) to reach the goal within a specified tolerance.
-    \item \textbf{Path efficiency:} Ratio of actual trajectory length to the geodesic distance on SE(3) between start and goal.
-    \item \textbf{Robustness:} Success rate under varying levels of measurement noise, partial occlusion, and lighting changes.
-    \item \textbf{Runtime:} Per-iteration inference time for each method.
-\end{enumerate}
-We propose to evaluate these metrics using Isaac sim environment and real-world experiments (if time allows).
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{SYSTEM ARCHITECTURE AND METHODOLOGY}
 
-\section{CHALLENGES}
+Our system consists of three modules: a perception front-end, a state estimator, and a servo controller. We implement two complete pipelines that share the same perception module but differ in how the observations are processed and fed to the robot. Fig.~\ref{fig:ibvs_pipeline} shows the baseline IBVS pipeline and Fig.~\ref{fig:ekf_pipeline} shows the EKF-PBVS pipeline.
 
-The main technical challenges we anticipate are:
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.42\textwidth]{visual_servo.png}
+    \caption{Baseline IBVS pipeline. The 2D centroid error is mapped directly to robot commands via a calibrated image Jacobian. No temporal filtering or 3D reconstruction is performed.}
+    \label{fig:ibvs_pipeline}
+\end{figure}
 
-\textbf{Fair comparison:} FoundationPose uses RGB-D and a CAD model as input. The EKF measurement model must be given comparable information (e.g., depth-based correspondences or rendered reference views) to avoid biasing the comparison.
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.42\textwidth]{visual_servo_ekf.png}
+    \caption{EKF-PBVS pipeline. The perception front-end produces a 2D centroid and metric depth, which the EKF fuses into a filtered 3D position. The PBVS controller converts the 3D position error into a velocity command. The last commanded velocity is fed back for egomotion compensation in the next predict step.}
+    \label{fig:ekf_pipeline}
+\end{figure}
 
-\textbf{EKF tuning:} The EKF's performance depends on process and measurement noise covariance tuning. We need to tune these carefully and report sensitivity.
+\subsection{Perception: Detect-Then-Track}
 
-\textbf{Simulation realism:} We need a rendering pipeline that produces realistic enough images for FoundationPose to work as intended, while also providing ground truth poses for evaluation.
+We adopt a two-phase strategy. Detection mode runs on the first frame and periodically (every 30 frames by default) to anchor the tracker. Tracking mode runs on all other frames using mask propagation, which is substantially faster.
 
-\textbf{Rotation representation:} Properly handling rotations and avoiding singularities in the EKF state update requires care, particularly when computing Jacobians on the SO(3) manifold.
+\textbf{Detection.}
+Given a reference image of the target object (an RGBA image where the alpha channel separates foreground from background), we extract dense patch-level features from both the reference and the live scene using DINOv2 ViT-B/14. The image is divided into $14 \times 14$ pixel patches, and DINOv2 produces a 768-dimensional feature vector for each patch. For every scene patch, we compute its mean cosine similarity to all foreground reference patches, producing a spatial similarity heatmap. This heatmap is thresholded at a configurable percentile (93rd by default), morphologically cleaned, and the connected component with the highest mean similarity is selected to produce a bounding box. We also compute a complementary feature similarity map using a truncated ResNet-18 backbone (output stride 32, 512-d features), and fuse the two maps via weighted average to improve robustness. The bounding box is then used as a prompt for SAM2, which returns a binary segmentation mask and low-resolution logits $\boldsymbol{\ell} \in \mathbb{R}^{1 \times 256 \times 256}$.
 
-\section{RESOURCES}
+\textbf{Tracking.}
+On subsequent frames, we bypass DINOv2 entirely and instead feed the previous frame's SAM2 logits as a \texttt{mask\_input} prompt on the new image. We also supply point prompts: the previous centroid as a positive point, and a set of background points (mined from the intersection of recent mask histories) as negatives. This gives SAM2 enough context to propagate the mask without re-running any feature extraction, achieving 5--10$\times$ faster per-frame processing. We monitor tracking quality by computing the IoU between the current and previous masks. If IoU drops below 0.35, we interpret this as drift and fall back to detection mode. Additionally, the first good detection is saved as a stable ``anchor'' mask and logits, which serve as a fallback if the tracker loses the object entirely.
 
-\textbf{Software:} FoundationPose (NVIDIA, open-source), OpenCV, NumPy/SciPy for the EKF implementation, PyBullet or Blender for synthetic rendering with ground truth poses.
+\textbf{Centroid extraction.}
+From the binary mask, we compute a robust centroid using morphological closing (to bridge gaps caused by printed textures on box surfaces), extraction of the largest external contour, and the center of its minimum-area bounding rectangle. This procedure is more stable than a naive moments-based centroid for rectangular objects with internal lines or text.
 
-\textbf{Datasets:} We will use synthetic scenes with known ground truth from Isaacsim simulation. We may additionally evaluate on YCB-Video objects rendered in simulation to test generalization.
+\subsection{Depth Estimation}
 
-\textbf{Compute:} Standard GPU for FoundationPose inference. The EKF runs on CPU. 
+We use Depth Anything V2 with a ViT-S encoder to produce a relative depth map from each RGB frame. Since the output is relative rather than metric, we convert it via an affine model: $Z_{\text{metric}} = s \cdot d_{\text{relative}} + b$, where $s$ and $b$ are calibration parameters. The object's metric depth is estimated as the median relative depth under the segmentation mask, converted to metres.
 
-\textbf{Hardware:} xARM manipulator with Zed mini camera.
+To reduce computational cost, we run depth inference only on every 5th frame with a valid detection (or on the very first detection, to initialize the EKF). On intermediate frames, the EKF propagates the depth forward using its constant-velocity process model, while the 2D-only measurement update continues to constrain the lateral position.
 
-\section{TIMELINE}
+\subsection{EKF Integration}
 
-\begin{tabular}{l l}
-\textbf{Weeks 1-2} & Set up FoundationPose, implement EKF pose \\
- & tracker, validate both on static frames. \\
-\textbf{Weeks 3-4} & Build simulated servoing loop, integrate both \\
- & methods, implement PBVS controller. \\
-\textbf{Week 5} & Run experiments: noise sweeps, occlusion, \\
- & lighting. Collect metrics. \\
-\textbf{Week 6} & Analysis, final writeup, presentation. \\
-\end{tabular}
+At each frame, the processing proceeds as follows. (1)~\textbf{Predict:} propagate the state and covariance forward using the constant-velocity model (Eq.~\ref{eq:process}), compensating for egomotion using the velocity from the last servo command. (2)~\textbf{Update:} if a depth measurement is available and exceeds 5\,cm (to reject invalid near-zero readings), perform the full 3-DOF update. Otherwise, perform the 2D-only update. (3)~\textbf{Output:} the filtered position $[X, Y, Z]^T$ is passed to the PBVS controller (Eq.~\ref{eq:pbvs}), and the scalar uncertainty $\sqrt{\text{tr}(\mathbf{P}_{1:3,1:3})}$ is displayed in the visualization overlay.
 
-\section{MID TERM DRAFT}
+The EKF is initialized from the first valid $(u, v, Z)$ measurement by backprojecting the centroid to 3D and setting the initial velocity to zero with a broad covariance. If the depth model is unavailable at startup, the EKF seeds itself with the PBVS target depth as a prior so the filter can begin operating. If the EKF has not yet initialized (no valid measurement has arrived), the system automatically falls back to the IBVS baseline.
 
-\aku{Our visual servoing pipeline performs real-time object localization in the camera frame using a detect-then-track architecture. In the detection phase, we extract dense patch-level features from both a reference object image and the live scene using DINOv2 (ViT-B/14), compute a cosine similarity map between foreground reference patches and scene patches, threshold and cluster this map to produce a bounding box, and then prompt SAM2 with that box to obtain a precise segmentation mask and low-resolution logits. In subsequent frames, we bypass the expensive DINOv2 feature extraction entirely and instead propagate the previous frame's SAM2 logits as a mask prompt on the new image, achieving 5–10× faster per-frame processing. The tracker monitors SAM2 confidence scores, mask area stability, and periodic frame counts to decide when to fall back to full re-detection. To estimate a grasp-quality target within the localized mask, we run monocular depth estimation (Depth Anything V2) and compute a quality score based on local depth smoothness — combining inverse depth gradient magnitude and local standard deviation — selecting the smoothest, most graspable region as the servo target. The resulting 2D centroid error relative to the image center is then mapped to robot end-effector corrections via a Jacobian estimated through an online optical-flow-based calibration procedure, closing the visual servoing loop.}
+\subsection{Metrics Logging}
 
-\section{Methodology}
+We instrument both pipelines with a CSV logger that records, for every frame: wall-clock timestamp, frame index, time since last frame, detection mode (detect vs. track), raw pixel centroid, EKF-filtered position and velocity, position uncertainty, metric depth, the servo command sent to the robot (dx, dy, dz in mm), the Euclidean position error, and the total per-iteration wall-clock time. This allows us to compute all evaluation metrics in post-processing without modifying the control loop itself.
 
- 
-Our system consists of three subsystems: (1)~a perception module that localises the target object, (2)~a state estimator that filters noisy observations into smooth pose estimates, and (3)~a PBVS controller that converts the estimated pose into robot commands.
-We implement variants of subsystem 2 to analyze which gives the better accuracy and overall trajectory.
+\subsection{Hardware Setup}
 
-\subsection{Perception Module: Detect-Then-Track}
- 
-\textbf{Detection mode} (first frame and re-detection):
-Dense patch-level features are extracted from both a reference image and the live scene using DINOv2 (ViT-B/14).
-For each scene patch, we compute the mean cosine similarity against all foreground reference patches, yielding a spatial similarity map.
-This map is thresholded (at a configurable percentile), morphologically cleaned, and clustered via connected components to produce a bounding box.
-The box is used as a prompt for SAM2, which returns an instance segmentation mask and low-resolution logits $\ell \in \mathbb{R}^{1 \times 256 \times 256}$.
+Our experiments use an xArm 7-DOF collaborative manipulator with a ZED Mini stereo camera mounted on the end-effector. The camera provides a 1280$\times$720 left image at 30 fps. We use only the left camera image (not stereo depth) so that the pipeline generalizes to monocular setups. DINOv2, SAM2, and Depth Anything V2 run on a single GPU. The EKF and servo controller run on CPU. Communication with the xArm uses the xArm Python SDK over Ethernet.
 
-\textbf{Tracking mode} (subsequent frames):
-The previous frame's SAM2 logits are passed as a \texttt{mask\_input} prompt to SAM2 on the new frame, propagating the segmentation without re-running DINOv2.
-This achieves $5$--$10\times$ faster per-frame processing.
-Tracking confidence is monitored via the SAM2 prediction score, mask area stability, and a periodic re-detection interval; if any trigger fires, the system reverts to detection mode.
- 
-The ResNet-18 feature similarity map can be fused with the DINOv2 similarity via a weighted combination for more robust detection
+Target objects are common household boxes (cereal boxes, shipping boxes, snack packages) shown in Fig.~\ref{fig:dataset}. No CAD models or prior 3D knowledge of the objects is required: the only input is a single reference photo with a transparent background.
 
-\subsection{EKF-Based Pose Tracker}
-\textcolor{red}{need to check then add}
-
-\subsection{PBVS Controller}
-Both estimators feed into a common PBVS controller.
-For Baseline, we use Image Based Visual Servoing (IBVS) using a calibrated $2 \times 2$ image Jacobian estimated via online optical-flow calibration.
-
-\section{REMAINING WORK}
-\begin{itemize}
-\item Complete FoundationPose integration into the PBVS loop.
-\item Run closed-loop servoing experiments in real world with multiple estimators.
-\item Collect metrics: final pose error, convergence rate, path efficiency, robustness under noise/occlusion, and per-frame runtime.
-\item Perform EKF noise covariance sensitivity analysis ($\mathbf{Q}$, $\mathbf{R}$ sweeps).
-\item Final analysis and writeup.
-\end{itemize}
-
-\section{TIMELINE}
-
-\begin{tabular}{l l}
-\textbf{Weeks 1-2 } & Implement DINO + SAM \\
-(DONE) & pipeline as baseline, \\
-& Implement EKF pose \\
-\textbf{Weeks 3-4} & Build servoing loop, integrate \\
- (DONE) & both methods, implement PBVS controller \\
- & for real world experiments \\
-\textbf{Week 5} & Implement FoundationPose and \\
-& Run experiments: noise sweeps, occlusion, \\
-& lighting. Collect metrics. \\
-\textbf{Week 6} & Analysis, final writeup, presentation. \\
-\end{tabular}
- 
 \begin{figure*}[t]
     \centering
-
-    % Row 1
     \includegraphics[width=0.24\textwidth]{objects/protein_bar.jpeg}\hfill
     \includegraphics[width=0.24\textwidth]{objects/baking_mix_box.jpeg}\hfill
     \includegraphics[width=0.24\textwidth]{objects/cardboard_box.jpeg}\hfill
     \includegraphics[width=0.24\textwidth]{objects/cheez_it_box.jpeg}
-
     \vspace{0.5em}
-
-    % Row 2
     \includegraphics[width=0.24\textwidth]{objects/brownie_box.jpeg}\hfill
     \includegraphics[width=0.24\textwidth]{objects/lamp_box.jpeg}\hfill
     \includegraphics[width=0.24\textwidth]{objects/cake_box.jpeg}\hfill
     \includegraphics[width=0.24\textwidth]{objects/protein_bar_2.jpeg}
-
-    \caption{Real World Boxes}
+    \caption{Target objects used in our experiments. These are common household boxes with varying textures, colors, and sizes. No CAD models are needed; the only input per object is one reference photo.}
     \label{fig:dataset}
 \end{figure*}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{PROGRESS AND REMAINING WORK}
+
+\subsection{Completed}
+\begin{itemize}
+\item DINOv2 + SAM2 detect-then-track perception pipeline with anchor-based drift recovery, negative point mining, and robust centroid extraction.
+\item IBVS baseline controller with online optical-flow Jacobian calibration.
+\item EKF pose tracker with constant-velocity process model, pinhole projection measurement model, analytical Jacobian, Joseph-form covariance update, egomotion compensation from servo commands, and 2D-only partial update fallback.
+\item Full integration of the EKF into the live servo loop, with automatic fallback to IBVS when the filter has not yet initialized.
+\item PBVS controller with proportional gain, dead zone, and per-axis velocity clamping.
+\item Depth Anything V2 integration with affine depth scaling and every-5th-frame scheduling.
+\item Per-frame CSV metrics logger recording all quantities needed for post-hoc evaluation.
+\item Complete real-hardware setup (xArm + ZED Mini) tested end-to-end in both IBVS and EKF-PBVS modes.
+\end{itemize}
+
+\subsection{Remaining Work}
+\begin{itemize}
+\item Integrate FoundationPose as an additional perception back-end, feeding its 6-DoF pose estimates into the same EKF and PBVS controller.
+\item Run closed-loop servoing experiments comparing all three configurations (IBVS baseline, EKF + DINOv2/SAM2, EKF + FoundationPose) across multiple target objects and starting configurations.
+\item Collect quantitative metrics from the logged CSV data: final position error (cm), number of iterations to convergence within a 1\,cm tolerance, path efficiency (actual trajectory length divided by straight-line distance), and per-iteration runtime broken down by perception, EKF, and servo stages.
+\item Perform EKF noise covariance sensitivity analysis by sweeping the process noise $\mathbf{Q}$ and measurement noise $\mathbf{R}$ parameters and measuring their effect on convergence speed and steady-state accuracy.
+\item Evaluate robustness under degraded conditions: partial occlusion of the target object and varied ambient lighting.
+\item Final analysis, comparison, and writeup.
+\end{itemize}
+
+\subsection{Scope Changes}
+Our original proposal focused on comparing FoundationPose against an EKF-based tracker. We began implementation with a DINOv2 + SAM2 perception front-end rather than FoundationPose for two practical reasons: FoundationPose requires a known CAD model and RGB-D input, while DINOv2 + SAM2 works from a single reference photo with monocular RGB, making it easier to get an end-to-end pipeline running on real hardware first. We still plan to integrate FoundationPose as an additional perception back-end in the coming weeks, so that the final comparison will include three configurations: raw IBVS (baseline), EKF-filtered DINOv2+SAM2 (PBVS), and EKF-filtered FoundationPose (PBVS). This staged approach lets us isolate the contribution of the EKF independently from the choice of perception model.
+
+\subsection{Updated Timeline}
+
+\begin{tabular}{l l}
+\textbf{Weeks 1--2} & DINOv2 + SAM2 perception pipeline, \\
+(Done) & IBVS baseline, initial EKF implementation. \\[2pt]
+\textbf{Weeks 3--4} & EKF integration into servo loop, \\
+(Done) & PBVS controller, depth estimation, \\
+& metrics logging, real hardware testing. \\[2pt]
+\textbf{Week 5} & Integrate FoundationPose, run comparison \\
+& experiments, collect metrics, Q/R sweeps. \\[2pt]
+\textbf{Week 6} & Analysis, final writeup, presentation. \\
+\end{tabular}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
 \begin{thebibliography}{9}
 
-\begin{figure}[h]
-    \centering
-    \includegraphics[width=0.45\textwidth]{visual_servo.png}
-   
-    \caption{Servo Pipeline using different localization methods}
-    \label{fig:two_images}
-\end{figure}
-
-\begin{figure}[h]
-    \centering
-    \includegraphics[width=0.45\textwidth]{visual_servo_ekf.png}
-   
-    \caption{Servo Pipeline using different localization methods}
-    \label{fig:two_images}
-\end{figure}
-
-
 \bibitem{foundationpose} B. Wen, W. Yang, J. Kautz, and S. Birchfield, ``FoundationPose: Unified 6D Pose Estimation and Tracking of Novel Objects,'' in \textit{Proc. IEEE/CVF CVPR}, 2024.
-
-\bibitem{cadena2016} C. Cadena et al., ``Past, Present, and Future of Simultaneous Localization and Mapping: Toward the Robust-Perception Age,'' \textit{IEEE Trans. Robotics}, vol. 32, no. 6, pp. 1309--1332, 2016.
 
 \bibitem{thrun2005} S. Thrun, W. Burgard, and D. Fox, \textit{Probabilistic Robotics}. MIT Press, 2005.
 
@@ -254,10 +289,15 @@ For Baseline, we use Image Based Visual Servoing (IBVS) using a calibrated $2 \t
 \bibitem{tao2026perceptioncontrol}
 A. Tao, J. Yang, S. Oparnica, and W. Xue, ``Perception-Control Coupled Visual Servoing for Textureless Objects Using Keypoint-Based EKF,'' arXiv preprint arXiv:2602.06834, 2026.
 
+\bibitem{dinov2}
+M. Oquab, T. Darcet, T. Moutakanni, et al., ``DINOv2: Learning Robust Visual Features without Supervision,'' \textit{Trans. on Machine Learning Research}, 2024.
+
+\bibitem{sam2}
+N. Ravi, V. Gabeur, Y.-T. Hu, et al., ``SAM 2: Segment Anything in Images and Videos,'' in \textit{Proc. International Conference on Learning Representations (ICLR)}, 2025.
+
+\bibitem{depthanything}
+L. Yang, B. Kang, Z. Huang, et al., ``Depth Anything V2,'' in \textit{Advances in Neural Information Processing Systems (NeurIPS)}, 2024.
 
 \end{thebibliography}
-
-
-
 
 \end{document}
