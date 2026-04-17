@@ -30,6 +30,9 @@
 \usepackage{amsmath} % assumes amsmath package installed
 \usepackage{amssymb}  % assumes amsmath package installed
 
+\usepackage{hyperref}
+\usepackage{xcolor}
+
 \title{\LARGE \bf
 FoundationPose vs.\ EKF-Based Stereo Pose Tracking for Manipulator Visual Servoing
 }
@@ -238,6 +241,8 @@ Target objects are common household boxes (cereal boxes, shipping boxes, snack p
 \section{PROGRESS AND REMAINING WORK}
 
 \subsection{Completed}
+
+Some initial result videos for real world experiments can be found \href{https://drive.google.com/file/d/1beLwBDPymnEFNrw9vw_qGlmb-9raleHW/view?usp=sharing}{\textcolor{blue}{here}}.
 \begin{itemize}
 \item DINOv2 + SAM2 detect-then-track perception pipeline with anchor-based drift recovery, negative point mining, and robust centroid extraction.
 \item IBVS baseline controller with online optical-flow Jacobian calibration.
