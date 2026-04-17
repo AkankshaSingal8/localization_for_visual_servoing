@@ -88,6 +88,25 @@ DINOV2_COLOR_WEIGHT  = 0.7     # weight for color vs DINOv2 features
 DINOV2_REDETECT_INTERVAL = 30  # re-run DINOv2 every N frames
 PATCH_SIZE = 14
 
+# ── Camera-to-robot mount rotation presets ──────────────────────────
+# Rotation R_cam_to_robot maps a vector from camera coords to robot
+# base coords: v_robot = R @ v_cam. Pick the preset that matches your
+# ZED Mini mount on the xArm, or pass a custom 9-float list via
+# --cam-to-robot. Default stays identity to preserve current behavior.
+CAM_ROT_PRESETS = {
+    # Camera axes already aligned with robot axes (original assumption)
+    "identity": np.eye(3),
+    # Typical eye-in-hand on xArm with ZED Mini looking forward:
+    #   cam +Z (forward) -> robot +X (forward)
+    #   cam +X (right)   -> robot -Y
+    #   cam +Y (down)    -> robot -Z
+    "zed_forward": np.array([
+        [0.0,  0.0, 1.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0],
+    ]),
+}
+
 
 # ═════════════════════════════════════════════════════════════════════
 #  Reference image pre-processing (runs once at startup)
@@ -362,7 +381,39 @@ class DINOv2CameraStreamer(threading.Thread):
         self._ekf = ekf
         self._pbvs = pbvs
         self._depth_scaler = depth_scaler
-        self._last_servo_vel = np.zeros(3)  # last commanded velocity for egomotion
+        # Last commanded camera-frame velocity (for EKF egomotion compensation).
+        # Includes both the PBVS correction and the constant approach, both in
+        # camera coordinates. Separate from the robot-frame command.
+        self._last_servo_vel_cam = np.zeros(3)
+
+        # Calibrate depth scaler to this metric depth when user presses 'c'.
+        # Overridden from argparse via --depth-cal-m.
+        self.depth_cal_m = 0.30
+
+        # Control pipeline:
+        #   "ekf"            = DINOv2+SAM2+DepthAnything -> EKF-PBVS (default)
+        #   "ibvs"           = raw centroid -> calibrated image Jacobian
+        #   "foundationpose" = SAM2 mask (once) -> FoundationPose 6-DoF
+        #                      -> EKF-PBVS using 3D position measurements
+        # Overridden from argparse via --mode.
+        self.pipeline_mode = "ekf"
+
+        # FoundationPose state (only used when pipeline_mode == "foundationpose")
+        self._fp = None                     # FoundationPoseWrapper, if active
+        self._fp_redetect_interval = 60     # frames between re-registration
+        self._fp_meas_noise = 0.008         # 8 mm isotropic measurement stddev
+        self._fp_frame_count = 0            # frames since last FP registration
+        # Latest ZED stereo depth map in metres (HxW float32). Populated by
+        # the camera thread only when FP mode is active; otherwise None.
+        self._latest_depth_m = None
+
+        # Last robot end-effector position [x, y, z, roll, pitch, yaw] mm/deg
+        # from FK, updated each servo step and logged per frame.
+        self._last_robot_pos = None
+
+        # Run tag recorded alongside each row so post-hoc analysis can
+        # separate concurrently open CSVs. Overridden from argparse.
+        self.run_tag = ""
 
         # Metrics CSV logger
         ts = time.strftime("%Y%m%d_%H%M%S")
@@ -370,7 +421,7 @@ class DINOv2CameraStreamer(threading.Thread):
         self._csv_file = open(self._csv_path, "w", newline="")
         self._csv_writer = csv.writer(self._csv_file)
         self._csv_writer.writerow([
-            "timestamp", "frame", "dt_ms", "mode",
+            "timestamp", "frame", "dt_ms", "mode", "pipeline", "run_tag",
             "centroid_u", "centroid_v",
             "ekf_x", "ekf_y", "ekf_z",
             "ekf_vx", "ekf_vy", "ekf_vz",
@@ -378,6 +429,11 @@ class DINOv2CameraStreamer(threading.Thread):
             "depth_metric",
             "servo_dx_mm", "servo_dy_mm", "servo_dz_mm",
             "err_m", "iter_time_ms",
+            "robot_x_mm", "robot_y_mm", "robot_z_mm",
+            # Raw FoundationPose translation before EKF smoothing, so
+            # post-hoc we can measure how much the filter damped the
+            # input jitter. Empty in non-FP modes.
+            "fp_raw_x", "fp_raw_y", "fp_raw_z",
         ])
         self._frame_idx = 0
         self._last_servo_cmd = (0.0, 0.0, 0.0, 0.0)  # dx, dy, dz, err
@@ -407,7 +463,43 @@ class DINOv2CameraStreamer(threading.Thread):
             logger.info("Tracker soft-reset (anchor kept)")
         elif key == ord("R"):
             self._full_reset()
+        elif key == ord("c"):
+            self._calibrate_depth()
         return False
+
+    def _calibrate_depth(self):
+        """
+        One-point calibration of DepthScaler using the current frame.
+
+        Assumes the tracked object is placed at ``self.depth_cal_m`` metres
+        from the camera. Uses the median relative depth under the latest
+        segmentation mask to compute scale = Z_known / d_relative.
+        """
+        with self.data_lock:
+            res = dict(self._result)
+        depth_rel = res.get("depth_np")
+        mask_np = res.get("mask_np")
+        if depth_rel is None or mask_np is None:
+            logger.warning(
+                "Depth calibration: no depth/mask available yet. "
+                "Hold still and press 'c' again after a detection.")
+            return
+        m = mask_np > 0
+        if not np.any(m):
+            logger.warning("Depth calibration: empty mask, aborting.")
+            return
+        d_rel_median = float(np.percentile(depth_rel[m], 50))
+        if abs(d_rel_median) < 1e-6:
+            logger.warning(
+                "Depth calibration: relative depth near zero (d=%.6f), "
+                "aborting.", d_rel_median)
+            return
+        self._depth_scaler.calibrate(d_rel_median, self.depth_cal_m)
+        logger.info(
+            "Depth calibrated at Z=%.3fm (d_rel=%.4f) -> scale=%.6f",
+            self.depth_cal_m, d_rel_median, self._depth_scaler.scale)
+        # Reset EKF so it re-initialises with the calibrated depth.
+        self._full_reset()
 
     def _run_calibration(self):
         logger.info("Calibration thread: waiting for models...")
@@ -415,17 +507,145 @@ class DINOv2CameraStreamer(threading.Thread):
         logger.info("Calibration thread: starting Y/Z Jacobian calibration.")
         self.robot.calibrate(self._get_frame)
 
+    # ─────────────────────────────────────────────────────────────────
+    #  FoundationPose helpers (used when pipeline_mode == "foundationpose")
+    # ─────────────────────────────────────────────────────────────────
+
+    def _init_foundationpose(self, mesh_path, mesh_extents_m, fp_repo_dir,
+                             weights_dir, est_refine_iter, track_refine_iter,
+                             redetect_interval, meas_noise):
+        """Lazy-import + construct the FoundationPose wrapper."""
+        from foundationpose_wrapper import (
+            FoundationPoseWrapper, FoundationPoseUnavailable)
+        try:
+            self._fp = FoundationPoseWrapper(
+                mesh_path=mesh_path,
+                mesh_extents_m=mesh_extents_m,
+                fp_repo_dir=fp_repo_dir,
+                weights_dir=weights_dir,
+                est_refine_iter=est_refine_iter,
+                track_refine_iter=track_refine_iter,
+            )
+            self._fp.setup()
+        except FoundationPoseUnavailable as exc:
+            logger.error("FoundationPose unavailable, falling back to EKF "
+                         "mode: %s", exc)
+            self.pipeline_mode = "ekf"
+            self._fp = None
+            return
+        self._fp_redetect_interval = int(redetect_interval)
+        self._fp_meas_noise = float(meas_noise)
+        logger.info("FoundationPose initialised "
+                    "(est_iter=%d, track_iter=%d, redetect=%d frames).",
+                    est_refine_iter, track_refine_iter, redetect_interval)
+
+    def _camera_intrinsics_matrix(self) -> np.ndarray:
+        """Build a 3x3 K matrix from the EKF's CameraIntrinsics."""
+        cam = self._ekf.cam
+        return np.array([
+            [cam.fx, 0.0,    cam.cx],
+            [0.0,    cam.fy, cam.cy],
+            [0.0,    0.0,    1.0],
+        ], dtype=np.float64)
+
+    def _run_foundationpose_step(self, frame_bgr: np.ndarray,
+                                 depth_m: np.ndarray) -> dict:
+        """
+        Produce one FP perception result dict. On the first frame (or after
+        a forced re-registration), uses the existing DINOv2+SAM2 detector to
+        get an object mask and then calls FP.register. On subsequent frames
+        runs FP.track_one directly.
+
+        Returns a ``res`` dict compatible with the existing logger/render,
+        populated with ``fp_pose`` (4x4), ``fp_position_cam`` (3,), derived
+        ``best_centroid`` (by projecting the 3D object origin), ``mode``
+        ("detect" or "track"), and ``mask_np``/``bbox`` if a mask was built.
+        """
+        res = {"mode": "track", "mask_np": None, "best_centroid": None,
+               "bbox": None, "fp_pose": None, "fp_position_cam": None}
+
+        if self._fp is None:
+            return res
+        if depth_m is None:
+            logger.warning("FP: no depth map available this frame, skipping.")
+            return res
+
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        K = self._camera_intrinsics_matrix()
+
+        need_register = (
+            not self._fp.is_registered
+            or self._fp_frame_count >= self._fp_redetect_interval)
+
+        if need_register:
+            # Reuse the existing DINOv2+SAM2 path to get a bool mask
+            logger.info("FP: running DINOv2+SAM2 to get registration mask")
+            dino_res = run_dinov2_pipeline(
+                frame_bgr, self.ref_model, self._tracker)
+            mask_np = dino_res.get("mask_np")
+            res["bbox"] = dino_res.get("bbox")
+            res["mask_np"] = mask_np
+            if mask_np is None:
+                logger.warning("FP: no mask produced, skipping registration.")
+                return res
+            ob_mask = mask_np > 0
+            try:
+                pose = self._fp.register(
+                    rgb=rgb, depth_m=depth_m, ob_mask=ob_mask, K=K)
+            except Exception as e:
+                logger.exception("FP register failed: %s", e)
+                return res
+            self._fp_frame_count = 0
+            res["mode"] = "detect"
+        else:
+            try:
+                pose = self._fp.track(rgb=rgb, depth_m=depth_m, K=K)
+            except Exception as e:
+                logger.exception("FP track failed: %s", e)
+                self._fp.reset()
+                return res
+            self._fp_frame_count += 1
+
+        res["fp_pose"] = pose
+        t_cam = pose[:3, 3].astype(np.float64)
+        res["fp_position_cam"] = t_cam
+        # Project the object origin to image coordinates for the overlay.
+        if t_cam[2] > 1e-4:
+            u = self._ekf.cam.fx * t_cam[0] / t_cam[2] + self._ekf.cam.cx
+            v = self._ekf.cam.fy * t_cam[1] / t_cam[2] + self._ekf.cam.cy
+            res["best_centroid"] = (int(round(u)), int(round(v)))
+        return res
+
+    def _refresh_fk(self):
+        """Read FK from the robot if we don't already have it for this tick.
+
+        The PBVS path caches FK whenever it successfully commands a move.
+        The IBVS path doesn't expose its FK read, so we poll here at low
+        rate (governed by VS_RATE in the servo loop) to keep a fresh
+        end-effector position in the CSV.
+        """
+        if self.robot is None or self.robot._arm is None:
+            return
+        try:
+            with self.robot._lock:
+                pos = self.robot._get_pos()
+            if pos is not None:
+                self._last_robot_pos = pos
+        except Exception:
+            pass
+
     # ── segmentation + EKF loop ─────────────────────────────────────────
     def _seg_loop(self):
         last_time = time.time()
         depth_run_counter = 0
+        last_fk_time = 0.0
 
         while not self.stop_event.is_set():
             # ── Check for full reset signal from camera thread ────
             if self._reset_event.is_set():
                 self._tracker.reset(keep_anchor=False)
                 self._ekf.reset()
-                self._last_servo_vel = np.zeros(3)
+                self._last_servo_vel_cam = np.zeros(3)
                 self._reset_event.clear()
                 logger.info("Tracker + EKF FULL reset")
 
@@ -439,45 +659,61 @@ class DINOv2CameraStreamer(threading.Thread):
                 dt = iter_start - last_time
                 last_time = iter_start
 
-                # ── 1. Perception: DINOv2 detection / SAM2 tracking ──
-                res = run_dinov2_pipeline(frame, self.ref_model, self._tracker)
+                # ── 1. Perception: FP or DINOv2+SAM2 ────────────────
+                if self.pipeline_mode == "foundationpose" and self._fp is not None:
+                    depth_m_frame = self._latest_depth_m
+                    res = self._run_foundationpose_step(frame, depth_m_frame)
+                else:
+                    res = run_dinov2_pipeline(frame, self.ref_model, self._tracker)
 
                 # ── 2. EKF predict (always, even without measurement) ─
-                robot_vel_cam = self._last_servo_vel if np.any(self._last_servo_vel) else None
+                robot_vel_cam = (self._last_servo_vel_cam
+                                 if np.any(self._last_servo_vel_cam) else None)
                 self._ekf.predict(dt, robot_vel_cam=robot_vel_cam)
 
+                # Centroid is used later by the CSV logger regardless of mode.
                 centroid = res.get("best_centroid")
-                if centroid is not None:
-                    u, v = float(centroid[0]), float(centroid[1])
 
-                    # ── 3. Depth estimation (every 5th frame to save cost)
-                    depth_metric = None
-                    depth_run_counter += 1
-                    if depth_run_counter % 5 == 0 or not self._ekf.is_initialised:
-                        dm = _get_depth_model()
-                        if dm is not None:
-                            mask_np = res.get("mask_np")
-                            try:
-                                depth_rel = dm.infer_image(frame).astype(np.float32)
-                                res["depth_np"] = depth_rel
-                                if mask_np is not None:
-                                    depth_metric = self._depth_scaler.estimate_object_depth(
-                                        depth_rel, mask_np, percentile=50)
-                            except Exception as e:
-                                logger.warning("Depth inference failed: %s", e)
+                # ── 3. EKF update: FP branch uses 3D position directly ───
+                if self.pipeline_mode == "foundationpose":
+                    fp_pos = res.get("fp_position_cam")
+                    if fp_pos is not None and fp_pos[2] > 0.05:
+                        self._ekf.update_3d_position(
+                            float(fp_pos[0]), float(fp_pos[1]),
+                            float(fp_pos[2]),
+                            meas_noise_pos=self._fp_meas_noise)
+                        res["depth_metric"] = float(fp_pos[2])
+                else:
+                    if centroid is not None:
+                        u, v = float(centroid[0]), float(centroid[1])
 
-                    # ── 4. EKF update ─────────────────────────────────
-                    if depth_metric is not None and depth_metric > 0.05:
-                        self._ekf.update(u, v, depth_metric)
-                        res["depth_metric"] = depth_metric
-                    elif self._ekf.is_initialised:
-                        self._ekf.update_2d_only(u, v)
-                        res["depth_metric"] = None
-                    else:
-                        default_z = self._pbvs.target_depth
-                        logger.info(f"EKF: seeding with default depth {default_z:.2f}m")
-                        self._ekf.update(u, v, default_z)
-                        res["depth_metric"] = None
+                        # Depth estimation (every 5th frame to save cost)
+                        depth_metric = None
+                        depth_run_counter += 1
+                        if depth_run_counter % 5 == 0 or not self._ekf.is_initialised:
+                            dm = _get_depth_model()
+                            if dm is not None:
+                                mask_np = res.get("mask_np")
+                                try:
+                                    depth_rel = dm.infer_image(frame).astype(np.float32)
+                                    res["depth_np"] = depth_rel
+                                    if mask_np is not None:
+                                        depth_metric = self._depth_scaler.estimate_object_depth(
+                                            depth_rel, mask_np, percentile=50)
+                                except Exception as e:
+                                    logger.warning("Depth inference failed: %s", e)
+
+                        if depth_metric is not None and depth_metric > 0.05:
+                            self._ekf.update(u, v, depth_metric)
+                            res["depth_metric"] = depth_metric
+                        elif self._ekf.is_initialised:
+                            self._ekf.update_2d_only(u, v)
+                            res["depth_metric"] = None
+                        else:
+                            default_z = self._pbvs.target_depth
+                            logger.info(f"EKF: seeding with default depth {default_z:.2f}m")
+                            self._ekf.update(u, v, default_z)
+                            res["depth_metric"] = None
 
                 # ── 5. Pack EKF state into result ─────────────────────
                 if self._ekf.is_initialised:
@@ -493,13 +729,27 @@ class DINOv2CameraStreamer(threading.Thread):
                     logger.info("Models ready, calibration may now proceed.")
                     self._models_ready.set()
 
-                # ── 6. Servo: PBVS if EKF is initialised, else IBVS ──
+                # ── 6. Servo: dispatch by pipeline mode ──────────────
+                # "ekf" and "foundationpose" use EKF-PBVS when filter is ready.
+                # "ibvs" forces raw IBVS even when EKF has a state estimate.
                 if self.robot is not None:
                     ekf_pos = res.get("ekf_position")
-                    if ekf_pos is not None:
+                    use_pbvs = (
+                        self.pipeline_mode in ("ekf", "foundationpose")
+                        and ekf_pos is not None)
+                    if use_pbvs:
                         self._servo_step_pbvs(ekf_pos)
-                    elif centroid is not None:
-                        self.robot.servo_step(centroid, frame.shape)
+                    else:
+                        raw_centroid = res.get("best_centroid")
+                        if raw_centroid is not None:
+                            self.robot.servo_step(raw_centroid, frame.shape)
+
+                # ── 6b. Refresh FK at VS_RATE so IBVS trajectories are
+                # logged even though RobotController.servo_step does not
+                # expose the position it reads.
+                if iter_start - last_fk_time > VS_RATE:
+                    self._refresh_fk()
+                    last_fk_time = iter_start
 
                 # ── 7. Log metrics to CSV ─────────────────────────────
                 iter_ms = (time.time() - iter_start) * 1000.0
@@ -521,11 +771,25 @@ class DINOv2CameraStreamer(threading.Thread):
                         return ""
                     return f"{val:{fmt}}" if fmt else str(val)
 
+                # Pull FK (cached from last servo step, or read now if stale).
+                # Cached form keeps per-frame overhead near zero.
+                rx = ry = rz = ""
+                if self._last_robot_pos is not None:
+                    rx = f"{self._last_robot_pos[0]:.2f}"
+                    ry = f"{self._last_robot_pos[1]:.2f}"
+                    rz = f"{self._last_robot_pos[2]:.2f}"
+
+                # Raw FoundationPose translation pre-filter, or empty
+                fp_raw = res.get("fp_position_cam")
+                fp_raw_cols = _fmt_vec(fp_raw)
+
                 self._csv_writer.writerow([
                     f"{iter_start:.6f}",
                     self._frame_idx,
                     f"{dt * 1000.0:.1f}",
                     res.get("mode", "track"),
+                    self.pipeline_mode,
+                    self.run_tag,
                     centroid[0] if centroid else "",
                     centroid[1] if centroid else "",
                     *_fmt_vec(ekf_pos),
@@ -535,6 +799,8 @@ class DINOv2CameraStreamer(threading.Thread):
                     f"{dx:.2f}", f"{dy:.2f}", f"{dz:.2f}",
                     f"{err:.6f}",
                     f"{iter_ms:.1f}",
+                    rx, ry, rz,
+                    *fp_raw_cols,
                 ])
                 self._csv_file.flush()
 
@@ -556,9 +822,9 @@ class DINOv2CameraStreamer(threading.Thread):
             return
         self.robot._last_t = now
 
-        v_robot, err_m = self._pbvs.compute_velocity(ekf_position)
+        v_robot, v_cam, err_m = self._pbvs.compute_velocity(ekf_position)
         if err_m < self._pbvs.dead_zone_m:
-            self._last_servo_vel = np.zeros(3)
+            self._last_servo_vel_cam = np.zeros(3)
             self._last_servo_cmd = (0.0, 0.0, 0.0, err_m)
             return
 
@@ -567,11 +833,17 @@ class DINOv2CameraStreamer(threading.Thread):
         dy_mm = float(v_robot[1]) * dt_step * 1000.0
         dz_mm = float(v_robot[2]) * dt_step * 1000.0
 
-        # Constant approach along robot X
+        # Constant approach along robot X (added after PBVS velocity)
         dx_mm += VS_APPROACH
 
-        # Store velocity for egomotion compensation next predict step
-        self._last_servo_vel = v_robot
+        # Store camera-frame velocity for EKF egomotion compensation.
+        # The EKF predict step expects velocity in camera coords, so we
+        # convert the approach component (robot X) through R_cam_to_robot.T
+        # and sum with the PBVS camera-frame velocity.
+        v_approach_robot = np.array(
+            [VS_APPROACH / (dt_step * 1000.0), 0.0, 0.0])
+        v_approach_cam = self._pbvs.robot_vel_to_cam(v_approach_robot)
+        self._last_servo_vel_cam = v_cam + v_approach_cam
         self._last_servo_cmd = (dx_mm, dy_mm, dz_mm, err_m)
 
         with self.robot._lock:
@@ -579,6 +851,7 @@ class DINOv2CameraStreamer(threading.Thread):
                 pos = self.robot._get_pos()
                 if pos is None:
                     return
+                self._last_robot_pos = pos
                 self.robot._arm.set_position(
                     x=pos[0] + dx_mm, y=pos[1] + dy_mm,
                     z=pos[2] + dz_mm,
@@ -613,7 +886,13 @@ class DINOv2CameraStreamer(threading.Thread):
         init_params.camera_resolution = res_map.get(ZED_RESOLUTION,
                                                      sl.RESOLUTION.HD720)
         init_params.camera_fps = 30
-        init_params.depth_mode = sl.DEPTH_MODE.NONE
+        # FoundationPose needs metric stereo depth from the ZED SDK; other
+        # modes skip it to save GPU time.
+        if self.pipeline_mode == "foundationpose":
+            init_params.depth_mode = sl.DEPTH_MODE.NEURAL
+            init_params.coordinate_units = sl.UNIT.METER
+        else:
+            init_params.depth_mode = sl.DEPTH_MODE.NONE
 
         err = cam.open(init_params)
         if err != sl.ERROR_CODE.SUCCESS:
@@ -621,11 +900,24 @@ class DINOv2CameraStreamer(threading.Thread):
             self._run_opencv()
             return
 
+        # Pull real intrinsics from the ZED SDK and push into the EKF's
+        # camera model so the Jacobian and backprojection are correct.
+        try:
+            cal = cam.get_camera_information().calibration_parameters.left_cam
+            self._ekf.cam.update(cal.fx, cal.fy, cal.cx, cal.cy)
+            logger.info(
+                "ZED intrinsics: fx=%.1f fy=%.1f cx=%.1f cy=%.1f",
+                cal.fx, cal.fy, cal.cx, cal.cy)
+        except Exception as e:
+            logger.warning(
+                "Failed to read ZED intrinsics, keeping defaults: %s", e)
+
         ts = time.strftime("%Y%m%d_%H%M%S")
         anno_path = os.path.abspath(f"vs_dinov2_{ts}.mp4")
         video_writer = None
 
         mat = sl.Mat()
+        depth_mat = sl.Mat() if self.pipeline_mode == "foundationpose" else None
         runtime_params = sl.RuntimeParameters()
 
         self._seg_thread = threading.Thread(target=self._seg_loop, daemon=True)
@@ -633,7 +925,7 @@ class DINOv2CameraStreamer(threading.Thread):
         if self.robot is not None and self.robot._arm is not None:
             threading.Thread(target=self._run_calibration, daemon=True).start()
 
-        win = "DINOv2 Servo  |  [v] servo  [r] reset  [q] quit"
+        win = "DINOv2 Servo  |  [v] servo  [c] cal-depth  [r] reset  [q] quit"
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
         try:
@@ -645,6 +937,15 @@ class DINOv2CameraStreamer(threading.Thread):
                 cam.retrieve_image(mat, sl.VIEW.LEFT)
                 frame_bgra = mat.get_data()
                 frame = frame_bgra[:, :, :3].copy()
+
+                # ZED stereo depth (metres). Invalid pixels come back as
+                # nan/inf; we zero them so FoundationPose's depth>=0.001
+                # validity check behaves correctly.
+                if depth_mat is not None:
+                    cam.retrieve_measure(depth_mat, sl.MEASURE.DEPTH)
+                    d = np.asarray(depth_mat.get_data(), dtype=np.float32)
+                    d = np.where(np.isfinite(d), d, 0.0)
+                    self._latest_depth_m = d
 
                 with self._frame_lock:
                     self._latest_left = frame.copy()
@@ -700,7 +1001,7 @@ class DINOv2CameraStreamer(threading.Thread):
         if self.robot is not None and self.robot._arm is not None:
             threading.Thread(target=self._run_calibration, daemon=True).start()
 
-        win = "DINOv2 Servo  |  [v] servo  [r] reset  [q] quit"
+        win = "DINOv2 Servo  |  [v] servo  [c] cal-depth  [r] reset  [q] quit"
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
         video_writer = None
@@ -811,9 +1112,20 @@ class DINOv2CameraStreamer(threading.Thread):
 
         # Status HUD
         status_lines = [
+            f"pipeline: {self.pipeline_mode.upper()}",
             f"anchor: {'LOCKED' if self._tracker.anchor_locked else 'no'}",
             f"frames: {self._tracker.frame_count}",
         ]
+        if self.pipeline_mode == "foundationpose":
+            fp_registered = bool(self._fp is not None and self._fp.is_registered)
+            status_lines.append(
+                f"FP: {'REG' if fp_registered else 'NOT-REG'} "
+                f"({self._fp_frame_count}/{self._fp_redetect_interval})")
+            fp_raw = res.get("fp_position_cam")
+            if fp_raw is not None:
+                status_lines.append(
+                    f"FP raw: X={fp_raw[0]:.3f} Y={fp_raw[1]:.3f} "
+                    f"Z={fp_raw[2]:.3f}m")
         if self.robot is not None:
             status_lines.append(f"servo: {'ON' if self.robot.enabled else 'OFF'}")
             status_lines.append(f"cal: {self.robot.cal_status}")
@@ -870,6 +1182,77 @@ if __name__ == "__main__":
                         help=f"Color similarity weight (default: {DINOV2_COLOR_WEIGHT})")
     parser.add_argument("--redetect-interval", type=int, default=DINOV2_REDETECT_INTERVAL,
                         help=f"Re-run DINOv2 every N frames (default: {DINOV2_REDETECT_INTERVAL})")
+    parser.add_argument("--cam-to-robot", choices=list(CAM_ROT_PRESETS.keys()),
+                        default="identity",
+                        help="Camera-to-robot rotation preset "
+                             "(default: identity; use 'zed_forward' for a "
+                             "typical eye-in-hand ZED Mini mount)")
+    parser.add_argument("--depth-cal-m", type=float, default=0.30,
+                        help="Known metric depth used when calibrating "
+                             "DepthScaler with keypress 'c' (default: 0.30 m)")
+    parser.add_argument("--mode",
+                        choices=["ekf", "ibvs", "foundationpose"],
+                        default="ekf",
+                        help="Control pipeline: 'ekf' (DINOv2+SAM2 -> EKF-PBVS, "
+                             "default), 'ibvs' (force raw IBVS baseline), "
+                             "or 'foundationpose' (FoundationPose 6-DoF -> "
+                             "EKF-PBVS).")
+    parser.add_argument("--run-tag", type=str, default="",
+                        help="Free-form tag written to every CSV row "
+                             "(e.g. 'cheezit_pose1_trial2').")
+    # FoundationPose-specific flags (ignored unless --mode foundationpose)
+    parser.add_argument("--fp-mesh", type=str, default=None,
+                        help="Path to OBJ/PLY CAD mesh (metres). Required "
+                             "for --mode foundationpose unless --fp-box is "
+                             "given.")
+    parser.add_argument("--fp-box", type=float, nargs=3, default=None,
+                        metavar=("W", "H", "D"),
+                        help="Build a procedural box mesh with these "
+                             "extents in metres (width height depth).")
+    parser.add_argument("--fp-repo-dir", type=str, default=None,
+                        help="Path to the NVLabs/FoundationPose repo "
+                             "(overrides $FOUNDATIONPOSE_ROOT).")
+    parser.add_argument("--fp-weights-dir", type=str, default=None,
+                        help="Path to the FoundationPose weights directory.")
+    parser.add_argument("--fp-est-iter", type=int, default=5,
+                        help="Refinement iterations for first-frame register.")
+    parser.add_argument("--fp-track-iter", type=int, default=2,
+                        help="Refinement iterations for per-frame tracking.")
+    parser.add_argument("--fp-redetect-interval", type=int, default=60,
+                        help="Re-run registration every N frames (0 = never).")
+    parser.add_argument("--fp-meas-noise", type=float, default=0.008,
+                        help="EKF measurement stddev for FP 3D position (m).")
+    # EKF tuning (for Q/R sensitivity sweep)
+    parser.add_argument("--process-noise-pos", type=float, default=0.01,
+                        help="EKF process-noise stddev on position (m).")
+    parser.add_argument("--process-noise-vel", type=float, default=0.1,
+                        help="EKF process-noise stddev on velocity (m/s).")
+    parser.add_argument("--meas-noise-uv", type=float, default=6.0,
+                        help="EKF measurement-noise stddev on pixel centroid "
+                             "(px; only used in 'ekf' mode).")
+    parser.add_argument("--meas-noise-z", type=float, default=0.10,
+                        help="EKF measurement-noise stddev on monocular depth "
+                             "(m; only used in 'ekf' mode).")
+    # Depth calibration persistence
+    parser.add_argument("--depth-scale", type=float, default=None,
+                        help="Pre-calibrated DepthScaler scale factor. Lets "
+                             "batch runs skip the per-trial 'c' keypress.")
+    parser.add_argument("--depth-offset", type=float, default=0.0,
+                        help="Pre-calibrated DepthScaler offset (default 0).")
+    # PBVS tuning (optional sweeps)
+    parser.add_argument("--pbvs-gain", type=float, default=0.4,
+                        help="PBVS proportional gain lambda.")
+    parser.add_argument("--target-depth", type=float, default=0.35,
+                        help="PBVS target depth Z* in metres.")
+    parser.add_argument("--pbvs-max-vel", type=float, default=0.015,
+                        help="PBVS per-axis velocity clamp in m/s "
+                             "(default matches the previously hardcoded "
+                             "value, so omitting this flag preserves old "
+                             "behavior).")
+    parser.add_argument("--pbvs-dead-zone", type=float, default=0.008,
+                        help="PBVS 3D position dead zone in metres "
+                             "(default matches the previously hardcoded "
+                             "value).")
     args = parser.parse_args()
 
     # Apply CLI overrides
@@ -898,19 +1281,39 @@ if __name__ == "__main__":
     cam_intrinsics = CameraIntrinsics(fx=700.0, fy=700.0, cx=640.0, cy=360.0)
     ekf = PoseEKF(
         cam_intrinsics,
-        process_noise_pos=0.01,
-        process_noise_vel=0.1,
-        meas_noise_uv=6.0,
-        meas_noise_z=0.10,
+        process_noise_pos=args.process_noise_pos,
+        process_noise_vel=args.process_noise_vel,
+        meas_noise_uv=args.meas_noise_uv,
+        meas_noise_z=args.meas_noise_z,
     )
+    R_cam_to_robot = CAM_ROT_PRESETS[args.cam_to_robot]
     pbvs = PBVSController(
-        gain=0.4,
-        target_depth=0.35,
-        max_vel=0.015,
-        dead_zone_m=0.008,
+        gain=args.pbvs_gain,
+        target_depth=args.target_depth,
+        max_vel=args.pbvs_max_vel,
+        dead_zone_m=args.pbvs_dead_zone,
+        R_cam_to_robot=R_cam_to_robot,
     )
-    depth_scaler = DepthScaler(default_scale=0.001)
-    logger.info("EKF + PBVS initialised")
+    # Depth scaler: if --depth-scale was supplied, skip the interactive
+    # calibration; otherwise start uncalibrated and warn the user.
+    if args.depth_scale is not None:
+        depth_scaler = DepthScaler(default_scale=args.depth_scale,
+                                   default_offset=args.depth_offset)
+        depth_scaler.calibrated = True
+        logger.info("Depth scaler pre-calibrated: scale=%.6f offset=%.4f",
+                    args.depth_scale, args.depth_offset)
+    else:
+        depth_scaler = DepthScaler(default_scale=0.001)
+        logger.warning(
+            "Depth scaler is UNCALIBRATED (default_scale=0.001). Place the "
+            "object at ~%.2fm and press 'c' to calibrate, or pass "
+            "--depth-scale <value>.", args.depth_cal_m)
+    logger.info(
+        "EKF + PBVS initialised (cam_to_robot=%s, Q_pos=%.4f Q_vel=%.3f "
+        "R_uv=%.2f R_z=%.4f gain=%.2f target_z=%.2fm)",
+        args.cam_to_robot, args.process_noise_pos, args.process_noise_vel,
+        args.meas_noise_uv, args.meas_noise_z, args.pbvs_gain,
+        args.target_depth)
 
     # Start camera streamer
     stop_ev = threading.Event()
@@ -924,6 +1327,24 @@ if __name__ == "__main__":
         depth_scaler=depth_scaler,
         use_pyzed=not args.no_pyzed,
     )
+    cam_thread.depth_cal_m = args.depth_cal_m
+    cam_thread.pipeline_mode = args.mode
+    cam_thread.run_tag = args.run_tag
+
+    if args.mode == "foundationpose":
+        if args.fp_mesh is None and args.fp_box is None:
+            parser.error("--mode foundationpose requires --fp-mesh or --fp-box")
+        cam_thread._init_foundationpose(
+            mesh_path=args.fp_mesh,
+            mesh_extents_m=tuple(args.fp_box) if args.fp_box else None,
+            fp_repo_dir=args.fp_repo_dir,
+            weights_dir=args.fp_weights_dir,
+            est_refine_iter=args.fp_est_iter,
+            track_refine_iter=args.fp_track_iter,
+            redetect_interval=args.fp_redetect_interval,
+            meas_noise=args.fp_meas_noise,
+        )
+
     cam_thread.start()
 
     try:

@@ -26,6 +26,13 @@ class CameraIntrinsics:
         self.cx = cx
         self.cy = cy
 
+    def update(self, fx, fy, cx, cy):
+        """Overwrite intrinsics in place (e.g. from ZED SDK calibration)."""
+        self.fx = float(fx)
+        self.fy = float(fy)
+        self.cx = float(cx)
+        self.cy = float(cy)
+
     def project(self, X, Y, Z):
         """3D camera-frame point → 2D pixel."""
         Z = max(Z, 1e-4)
@@ -224,6 +231,59 @@ class PoseEKF:
             self.x[2] = 0.05
 
     # ─────────────────────────────────────────────────────────────
+    #  Update with direct 3D position (e.g. from FoundationPose)
+    # ─────────────────────────────────────────────────────────────
+
+    def update_3d_position(self, X, Y, Z, meas_noise_pos=0.01):
+        """
+        EKF update when the measurement is already a 3D position in the
+        camera frame — e.g. the translation column from a FoundationPose
+        4x4 pose estimate.
+
+        The measurement model is the identity on the position states:
+            h(x) = [X, Y, Z]^T,    H = [I_3 | 0_3]
+
+        Parameters
+        ----------
+        X, Y, Z : float
+            Observed object position in the camera frame (metres).
+        meas_noise_pos : float
+            Isotropic position measurement standard deviation (metres).
+            Defaults to 1 cm, which is a reasonable baseline for a
+            pose estimator operating on metric RGB-D input.
+        """
+        if not self._initialised:
+            # Seed directly from the 3D measurement with zero velocity.
+            self.x = np.array([X, Y, Z, 0.0, 0.0, 0.0])
+            self.P = np.diag([0.02, 0.02, 0.05, 0.5, 0.5, 0.5])
+            self._initialised = True
+            return
+
+        H = np.zeros((3, self.DIM_STATE))
+        H[0, 0] = 1.0
+        H[1, 1] = 1.0
+        H[2, 2] = 1.0
+
+        R3 = np.eye(3) * (meas_noise_pos ** 2)
+
+        z_meas = np.array([X, Y, Z])
+        z_pred = self.x[:3].copy()
+        y = z_meas - z_pred
+
+        S = H @ self.P @ H.T + R3
+        try:
+            K = self.P @ H.T @ np.linalg.inv(S)
+        except np.linalg.LinAlgError:
+            K = self.P @ H.T @ np.linalg.pinv(S)
+
+        self.x = self.x + K @ y
+        I_KH = np.eye(self.DIM_STATE) - K @ H
+        self.P = I_KH @ self.P @ I_KH.T + K @ R3 @ K.T
+
+        if self.x[2] < 0.05:
+            self.x[2] = 0.05
+
+    # ─────────────────────────────────────────────────────────────
     #  Update with 2D only (no depth measurement)
     # ─────────────────────────────────────────────────────────────
 
@@ -304,7 +364,8 @@ class PBVSController:
                  gain=0.5,
                  target_depth=0.30,
                  max_vel=0.02,
-                 dead_zone_m=0.005):
+                 dead_zone_m=0.005,
+                 R_cam_to_robot=None):
         """
         Parameters
         ----------
@@ -316,6 +377,10 @@ class PBVSController:
             Maximum commanded velocity per axis (m/s).
         dead_zone_m : float
             Position error below which we stop commanding motion.
+        R_cam_to_robot : (3,3) array, optional
+            Rotation mapping a vector expressed in camera coordinates
+            to robot base coordinates. Defaults to identity (camera axes
+            aligned with robot). Override for your ZED-on-xArm mount.
         """
         self.gain = gain
         self.target_depth = target_depth
@@ -324,7 +389,10 @@ class PBVSController:
 
         # Camera-to-robot rotation (identity = camera aligned with robot)
         # Override after calibration for your setup
-        self.R_cam_to_robot = np.eye(3)
+        if R_cam_to_robot is None:
+            self.R_cam_to_robot = np.eye(3)
+        else:
+            self.R_cam_to_robot = np.asarray(R_cam_to_robot, dtype=np.float64)
 
     def compute_velocity(self, obj_position_cam):
         """
@@ -339,6 +407,9 @@ class PBVSController:
         -------
         v_robot : array (3,)
             Velocity command [vx, vy, vz] in robot base frame (m/s).
+        v_cam : array (3,)
+            Same velocity expressed in the camera frame. Useful for EKF
+            egomotion compensation, which is defined in camera coords.
         err_norm : float
             Euclidean position error (metres).
         """
@@ -348,7 +419,7 @@ class PBVSController:
         err_norm = float(np.linalg.norm(error))
 
         if err_norm < self.dead_zone_m:
-            return np.zeros(3), err_norm
+            return np.zeros(3), np.zeros(3), err_norm
 
         # PBVS control law: camera-frame velocity
         v_cam = -self.gain * error
@@ -359,7 +430,11 @@ class PBVSController:
         # Transform to robot frame
         v_robot = self.R_cam_to_robot @ v_cam
 
-        return v_robot, err_norm
+        return v_robot, v_cam, err_norm
+
+    def robot_vel_to_cam(self, v_robot):
+        """Transform a robot-frame velocity vector into the camera frame."""
+        return self.R_cam_to_robot.T @ np.asarray(v_robot, dtype=np.float64)
 
 
 class DepthScaler:

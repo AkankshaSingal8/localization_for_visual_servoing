@@ -1,0 +1,69 @@
+# Three-way paired comparison: IBVS vs EKF-PBVS (DINOv2+SAM2) vs EKF-PBVS (FoundationPose)
+#
+# Run with:
+#   python run_batch.py --trials trials_threeway.yaml --csv-dir runs/threeway
+#
+# Then:
+#   python analyze_csvs.py runs/threeway --tol-cm 1.0 --csv runs/threeway_summary.csv
+#
+# Tweak:
+#   - Replace FOUNDATIONPOSE_ROOT path with the real one on the GPU box.
+#   - Once you've done a one-time depth calibration ('c' keypress in a
+#     solo run), record the scale value and add depth_scale to `common`
+#     so subsequent trials skip the calibration step.
+#   - Replace fp_box values with the actual measured extents of each box
+#     in metres (width height depth).
+
+common:
+    cam_to_robot: zed_forward
+    depth_cal_m: 0.30
+    # depth_scale: 0.00123   # uncomment once calibrated
+    fp_repo_dir: /home/YOU/FoundationPose
+
+trials:
+    # ── Cheez-It box, centered-far start pose ───────────────────────
+    - tag: cheezit_pose1_ibvs_t1
+      mode: ibvs
+      reference: ../masked_objects/cheez_it_box.png
+
+    - tag: cheezit_pose1_ekf_t1
+      mode: ekf
+      reference: ../masked_objects/cheez_it_box.png
+
+    - tag: cheezit_pose1_fp_t1
+      mode: foundationpose
+      reference: ../masked_objects/cheez_it_box.png
+      fp_box: [0.19, 0.06, 0.22]    # measure your box and edit
+
+    # ── Cheez-It box, off-axis start pose (reset before each) ───────
+    - tag: cheezit_pose2_ibvs_t1
+      mode: ibvs
+      reference: ../masked_objects/cheez_it_box.png
+      notes: "Start: off-axis left, ~0.50m"
+
+    - tag: cheezit_pose2_ekf_t1
+      mode: ekf
+      reference: ../masked_objects/cheez_it_box.png
+      notes: "Start: off-axis left, ~0.50m"
+
+    - tag: cheezit_pose2_fp_t1
+      mode: foundationpose
+      reference: ../masked_objects/cheez_it_box.png
+      fp_box: [0.19, 0.06, 0.22]
+      notes: "Start: off-axis left, ~0.50m"
+
+    # ── Amazon tissue box (plain colors, different aspect) ──────────
+    - tag: tissue_pose1_ibvs_t1
+      mode: ibvs
+      reference: ../masked_objects/amazon_tissue_box.png
+
+    - tag: tissue_pose1_ekf_t1
+      mode: ekf
+      reference: ../masked_objects/amazon_tissue_box.png
+
+    - tag: tissue_pose1_fp_t1
+      mode: foundationpose
+      reference: ../masked_objects/amazon_tissue_box.png
+      fp_box: [0.21, 0.07, 0.12]    # measure and edit
+
+    # ── Repeat each 2x for variance (append as needed) ──────────────

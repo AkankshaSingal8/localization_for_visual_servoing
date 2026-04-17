@@ -1,0 +1,47 @@
+# Example trials file for run_batch.py
+# Edit the reference paths + add/remove trials, then run:
+#     python run_batch.py --trials trials_example.yaml --csv-dir runs/session1
+
+common:
+    cam_to_robot: zed_forward     # or "identity" if your mount is aligned
+    depth_cal_m: 0.30             # calibrate with keypress 'c' before runs
+
+trials:
+    # Same object, same start pose, IBVS vs EKF-PBVS (paired comparison)
+    - tag: cheezit_pose1_ibvs_t1
+      mode: ibvs
+      reference: ../masked_objects/cheez_it_box.png
+      notes: "Start pose: center-far (~0.45m)"
+
+    - tag: cheezit_pose1_ekf_t1
+      mode: ekf
+      reference: ../masked_objects/cheez_it_box.png
+      notes: "Start pose: center-far (~0.45m)"
+
+    - tag: cheezit_pose1_ibvs_t2
+      mode: ibvs
+      reference: ../masked_objects/cheez_it_box.png
+
+    - tag: cheezit_pose1_ekf_t2
+      mode: ekf
+      reference: ../masked_objects/cheez_it_box.png
+
+    # Different object, same comparison structure
+    - tag: tissue_pose1_ibvs_t1
+      mode: ibvs
+      reference: ../masked_objects/amazon_tissue_box.png
+
+    - tag: tissue_pose1_ekf_t1
+      mode: ekf
+      reference: ../masked_objects/amazon_tissue_box.png
+
+    # Off-axis start pose
+    - tag: cheezit_pose2_ibvs_t1
+      mode: ibvs
+      reference: ../masked_objects/cheez_it_box.png
+      notes: "Start pose: off-axis left"
+
+    - tag: cheezit_pose2_ekf_t1
+      mode: ekf
+      reference: ../masked_objects/cheez_it_box.png
+      notes: "Start pose: off-axis left"

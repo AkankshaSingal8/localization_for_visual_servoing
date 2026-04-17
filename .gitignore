@@ -64,3 +64,4 @@ Thumbs.db
 
 # PyTorch / CUDA
 *.onnx
+PROJECT_OVERVIEW.md

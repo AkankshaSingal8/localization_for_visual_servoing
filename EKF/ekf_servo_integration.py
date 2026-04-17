@@ -148,8 +148,8 @@ def servo_step_pbvs(robot, pbvs, ekf_position, ekf_velocity):
         return
     robot._last_t = now
 
-    # PBVS computes velocity in robot frame
-    v_robot, err_m = pbvs.compute_velocity(ekf_position)
+    # PBVS computes velocity in robot frame (and camera frame)
+    v_robot, v_cam, err_m = pbvs.compute_velocity(ekf_position)
 
     if err_m < pbvs.dead_zone_m:
         return
