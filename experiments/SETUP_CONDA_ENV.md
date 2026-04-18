@@ -78,19 +78,37 @@ driver's CUDA version. Check your driver:
 
 ```bash
 nvidia-smi | grep "CUDA Version"
-# Typical: "CUDA Version: 12.1" or "11.8" or "12.4"
+# Typical: "CUDA Version: 12.1", "11.8", "12.4", "12.8"
 ```
 
-Install the PyTorch wheel matching your CUDA:
+### Picking the right wheel
+
+NVIDIA drivers are **forward compatible** with PyTorch CUDA builds
+older than the driver. So a driver reporting CUDA 12.8 can run any
+PyTorch cu11x/cu121/cu124/cu128 build. You do NOT need a PyTorch wheel
+that exactly matches the driver's CUDA version.
+
+For this project we pin to **PyTorch 2.1.0 on cu121** because
+FoundationPose, kaolin 0.15.0, and pytorch3d were all tested against
+that combination. Using a newer PyTorch tends to cascade-break the
+FP dependency chain.
+
+| Driver CUDA | Recommended wheel | Index URL |
+|---|---|---|
+| 11.8 | torch 2.1.0 cu118 | `https://download.pytorch.org/whl/cu118` |
+| 12.1 | torch 2.1.0 cu121 | `https://download.pytorch.org/whl/cu121` |
+| 12.4 | torch 2.1.0 cu121 | `https://download.pytorch.org/whl/cu121` |
+| **12.8** | **torch 2.1.0 cu121** | `https://download.pytorch.org/whl/cu121` |
+
+The reason cu121 is the pick even for a cu12.8 driver: PyTorch's cu124
+and cu128 wheels only exist for PyTorch 2.4+, which is too new for
+FoundationPose's pinned deps.
+
+### Install command (for CUDA 12.8 driver)
 
 ```bash
-# For CUDA 12.1:
 pip install torch==2.1.0 torchvision==0.16.0 \
     --index-url https://download.pytorch.org/whl/cu121
-
-# For CUDA 11.8:
-# pip install torch==2.1.0 torchvision==0.16.0 \
-#     --index-url https://download.pytorch.org/whl/cu118
 
 # Verify PyTorch sees the GPU
 python -c "
@@ -98,12 +116,65 @@ import torch
 print('CUDA available:', torch.cuda.is_available())
 print('Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NONE')
 print('PyTorch version:', torch.__version__)
+print('PyTorch CUDA version:', torch.version.cuda)
 "
 ```
 
-**You must see `CUDA available: True` before proceeding.** If not, your
-CUDA version, driver, or wheel selection is wrong; fix it here before
-installing anything else.
+**You must see `CUDA available: True` before proceeding.** Expected
+output (driver 12.8 + wheel cu121):
+```
+CUDA available: True
+Device: <your GPU name>
+PyTorch version: 2.1.0+cu121
+PyTorch CUDA version: 12.1
+```
+
+The `12.1` PyTorch version is correct — your 12.8 driver runs the 12.1
+build via forward compatibility.
+
+### ⚠️ If your env is Python 3.11 (or anything other than 3.9)
+
+FoundationPose's dependency chain (specifically `kaolin==0.15.0`) has
+prebuilt wheels only for Python 3.8-3.10. On Python 3.11 you will hit
+"no matching distribution" when `pip install kaolin==0.15.0` runs in
+Step 4.
+
+You have three options:
+
+**Option A (recommended): recreate the env with Python 3.9**
+
+Fastest and most reliable. Your existing Python 3.11 env is still there
+in other projects; this only recreates *this* specific env.
+
+```bash
+conda deactivate
+conda env remove -n foundationpose -y
+conda create -n foundationpose python=3.9 -y
+conda activate foundationpose
+# Now restart from Step 3
+```
+
+**Option B: keep Python 3.11 and use newer kaolin**
+
+Kaolin 0.16+ supports Python 3.11 but requires PyTorch 2.2+, which
+means you also need to bump PyTorch. Try:
+
+```bash
+pip install torch==2.4.0 torchvision==0.19.0 \
+    --index-url https://download.pytorch.org/whl/cu121
+# In Step 4 below, use kaolin==0.17.0 instead of 0.15.0
+```
+
+This sometimes works, sometimes doesn't — FoundationPose was not tested
+against these versions. If FP fails to build or produces wrong poses,
+fall back to Option A.
+
+**Option C: skip FoundationPose entirely**
+
+If you're only running Methods 1 and 2 (IBVS and EKF-DINOv2), you can
+stay on Python 3.11 and skip Steps 4-6 (FoundationPose deps and build).
+You'll still need the project deps in Step 7. This is a valid starting
+point to get experiments going while the FP env is sorted.
 
 ---
 
@@ -328,9 +399,26 @@ Uninstall PyTorch and reinstall the right wheel:
 
 ```bash
 pip uninstall torch torchvision -y
+# For any CUDA 12.x driver, cu121 is the safe bet:
 pip install torch==2.1.0 torchvision==0.16.0 \
-    --index-url https://download.pytorch.org/whl/cu<YOUR_VERSION>
+    --index-url https://download.pytorch.org/whl/cu121
 ```
+
+### `pip install kaolin==0.15.0` says "no matching distribution"
+
+You're on Python 3.10+ and kaolin's prebuilt wheels only go up to 3.10.
+Easiest fix is to recreate the env with Python 3.9:
+
+```bash
+conda deactivate
+conda env remove -n foundationpose -y
+conda create -n foundationpose python=3.9 -y
+conda activate foundationpose
+# Restart from Step 3
+```
+
+Alternatively, if you must keep Python 3.11, try `kaolin==0.17.0` with
+`torch==2.4.0`. See the Python 3.11 section in Step 3 above.
 
 ### `nvdiffrast` build fails with "nvcc not found"
 
