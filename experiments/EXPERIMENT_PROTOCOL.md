@@ -1,10 +1,13 @@
 # Experiment Day Protocol
 
-Exact steps, commands, and what-to-do-with-your-hands for the three
-experiments. Everything variable is auto-captured in the CSV via the
-per-trial `run_tag`, so the only thing you need to track on paper is a
-high-level session log ("session started 10:45, object placement chart
-as drawn on whiteboard").
+Exact steps, commands, and what-to-do-with-your-hands for the
+per-pipeline three-way evaluation (3 experiments x 5 objects = 15
+trials, single start pose P1). Each experiment is one pipeline swept
+over all five objects; run them back-to-back. Everything variable is
+auto-captured in the CSV via the per-trial `run_tag`, so the only
+thing you need to track on paper is a high-level session log
+("session started 10:45, object placement chart as drawn on
+whiteboard").
 
 ---
 
@@ -17,11 +20,10 @@ as drawn on whiteboard").
 - Mount the ZED Mini on the end-effector using the bracket; plug in
   USB.
 - Plug the arm into the network (ethernet, 192.168.1.241).
-- Clear the workspace. Put masking tape on the table to mark three
-  object positions labelled **P1** (centered, ~50 cm from home pose
-  in the forward direction), **P2** (20° to the left of the optical
-  axis at the same distance), **P3** (15° above the optical axis, so
-  the object is on a small stand). Use a ruler; mark with tape.
+- Clear the workspace. Put masking tape on the table to mark the
+  single object position **P1** (centered, ~50 cm from home pose in
+  the forward direction). Use a ruler; mark with tape. All 15 trials
+  use this same P1 location; only the object and pipeline change.
 
 ### Step 0.2: Software
 
@@ -75,7 +77,7 @@ python FoundationModel/dinov2_servo.py \
   `0.001234`.
 - Press `q` to quit.
 
-### Step 0.5: Generate trial files
+### Step 0.5: Generate trial file
 
 ```bash
 python experiments/generate_trials.py \
@@ -83,14 +85,19 @@ python experiments/generate_trials.py \
     --fp-repo-dir $FOUNDATIONPOSE_ROOT
 ```
 
-This writes three files into `experiments/`:
-- `trials_main.yaml` (90 trials, Experiment 1)
-- `trials_robustness.yaml` (36 trials, Experiment 2)
-- `trials_qr_sweep.yaml` (16 trials, Experiment 3)
+This writes one file into `experiments/`:
+- `trials_main.yaml` (15 trials: 3 experiments x 5 objects)
+
+Trials are ordered by pipeline (Experiment 1 first, then 2, then 3),
+so you run one pipeline to completion before moving to the next.
+Within each experiment you cycle through the five objects in a fixed
+order. Experiment 1 = Pipeline A (IBVS), Experiment 2 = Pipeline B
+(EKF + DINOv2/SAM2/DepthAnything), Experiment 3 = Pipeline C (EKF +
+FoundationPose).
 
 ---
 
-## Experiment 1: Main three-way comparison (~60 min)
+## Per-pipeline three-way evaluation (~20 min)
 
 ### Step 1.1: Launch
 
@@ -98,24 +105,23 @@ This writes three files into `experiments/`:
 cd experiments
 python run_batch.py \
     --trials trials_main.yaml \
-    --csv-dir runs/exp1_main
+    --csv-dir runs/main
 ```
 
 The runner prints the first trial's info and waits for you to press
 ENTER.
 
-### Step 1.2: Per-trial loop (repeat 90 times)
+### Step 1.2: Per-trial loop (repeat 15 times)
 
 For each trial prompt:
 
-1. **Read the tag**. The runner prints e.g. `cheezit_centered_far_ekf_t1`.
-   The tag tells you: object = cheezit, pose = centered_far, mode =
-   ekf, trial = 1.
+1. **Read the tag**. The runner prints e.g. `cheezit_ekf`. The tag
+   tells you: object = cheezit, pipeline = ekf. All trials are at
+   start pose P1 and there are no repeats, so no extra suffix.
 
 2. **Physically set up the scene**:
    - Place the right object (cheezit / tissue / cardboard / protein /
-     brownie) at the right tape-marked position (P1/P2/P3 for
-     centered_far / off_axis_left / off_axis_high).
+     brownie) at the tape-marked P1 position.
    - Move the robot to a consistent "home" pose. On the arm's teach
      pendant or via Python, send it back to a fixed start. A simple
      script:
@@ -141,7 +147,7 @@ For each trial prompt:
 6. **Watch it converge** or fail. Typical run: 10-30 s.
 
 7. **When done**, press `q` to end the trial. The CSV is automatically
-   saved to `runs/exp1_main/<tag>.csv`.
+   saved to `runs/main/<tag>.csv`.
 
 The runner auto-advances to the next trial.
 
@@ -159,74 +165,16 @@ batch runner will still save the bad CSV but you can delete it later.
 
 ### Step 1.3: Mid-session analysis (optional, ~30 s)
 
-After every ~15 trials, spot-check:
+After each pipeline's 5-trial block, spot-check:
 
 ```bash
-python analyze_csvs.py runs/exp1_main
+python analyze_csvs.py runs/main
 ```
 
 You'll see a live table of everything done so far. If IBVS trials are
 showing final errors above 5 cm consistently, something's off with
-the calibration — pause, investigate.
-
----
-
-## Experiment 2: Robustness (~25 min)
-
-### Step 2.1: Launch
-
-```bash
-cd experiments
-python run_batch.py \
-    --trials trials_robustness.yaml \
-    --csv-dir runs/exp2_robustness
-```
-
-### Step 2.2: Per-trial loop (repeat 36 times)
-
-Tags look like `cheezit_occlusion_ekf_t1`. The **condition** (baseline
-/ occlusion / dim_light / distractor) is the second field. Set up the
-scene according to the condition:
-
-- **baseline**: normal lighting, clean table, Cheez-It at position P1.
-- **occlusion**: same as baseline, but during the trial (after the arm
-  starts moving), briefly wave your hand across ~30% of the object for
-  ~2 seconds, then remove. Do this around the 5-second mark.
-- **dim_light**: turn off the main room lights, close blinds. Keep one
-  side lamp on. Object at P1.
-- **distractor**: place a second box of similar color 15 cm to the
-  left of the target. Object (target) at P1.
-
-Then same loop as Experiment 1: home robot, press ENTER, wait for
-lock, press `v`, watch, press `q`.
-
-### Robustness-specific notes
-
-For the `occlusion` trials, press `v` first, count to 5, *then*
-introduce the occlusion. This lets the EKF's uncertainty trace show a
-clear spike when the object is hidden and recovery when it's back.
-
----
-
-## Experiment 3: Q/R sensitivity sweep (~10 min)
-
-### Step 3.1: Launch
-
-```bash
-cd experiments
-python run_batch.py \
-    --trials trials_qr_sweep.yaml \
-    --csv-dir runs/exp3_qr_sweep
-```
-
-### Step 3.2: Per-trial loop (repeat 16 times)
-
-Same object (Cheez-It), same pose (P1), every trial. The only thing
-that changes is the EKF's Q and R parameters, which are encoded in the
-tag. You don't need to change anything physically between trials —
-just reset the robot home pose and press ENTER.
-
-Tags look like `cheezit_q0p010_r6_t1` meaning Q_pos = 0.010, R_uv = 6.0.
+the calibration — pause, investigate before starting the next
+pipeline.
 
 ---
 
@@ -237,25 +185,15 @@ Tags look like `cheezit_q0p010_r6_t1` meaning Q_pos = 0.010, R_uv = 6.0.
 ```bash
 cd experiments
 
-# Exp 1: main comparison
-python analyze_csvs.py runs/exp1_main \
+python analyze_csvs.py runs/main \
     --tols-cm 0.5,1.0,2.0 \
-    --csv runs/summaries/exp1_main.csv
-
-# Exp 2: robustness
-python analyze_csvs.py runs/exp2_robustness \
-    --tols-cm 0.5,1.0,2.0 \
-    --csv runs/summaries/exp2_robustness.csv
-
-# Exp 3: Q/R sweep (looser tol is more informative here)
-python analyze_csvs.py runs/exp3_qr_sweep \
-    --tols-cm 1.0,2.0,5.0 \
-    --csv runs/summaries/exp3_qr_sweep.csv
+    --csv runs/summaries/main.csv
 ```
 
-Each stdout ends with an **aggregate pass-rate table** grouped by
-pipeline (or, for Exp 3, effectively grouped by Q value via the
-run_tag). That aggregate is what goes into the paper verbatim.
+Stdout ends with an **aggregate pass-rate table** grouped by pipeline
+— one row per experiment (1 / 2 / 3) summarizing that experiment's 5
+per-object subcomponents. That aggregate is what goes into the paper
+verbatim.
 
 ### Post-session file list
 
@@ -263,22 +201,24 @@ After the day, you should have:
 
 ```
 experiments/runs/
-├── exp1_main/                # 90 CSV files
-│   ├── cheezit_centered_far_ibvs_t1.csv
-│   ├── cheezit_centered_far_ibvs_t2.csv
+├── main/                     # 15 CSV files (5 per experiment)
+│   ├── cheezit_ibvs.csv      # Experiment 1 trials
+│   ├── tissue_ibvs.csv
+│   ├── cardboard_ibvs.csv
+│   ├── protein_ibvs.csv
+│   ├── brownie_ibvs.csv
+│   ├── cheezit_ekf.csv       # Experiment 2 trials
 │   ├── ...
-├── exp2_robustness/          # 36 CSVs
-├── exp3_qr_sweep/            # 16 CSVs
-└── summaries/                # 3 summary CSVs ready for the paper
-    ├── exp1_main.csv
-    ├── exp2_robustness.csv
-    └── exp3_qr_sweep.csv
+│   ├── cheezit_foundationpose.csv    # Experiment 3 trials
+│   └── ...
+└── summaries/                # 1 summary CSV ready for the paper
+    └── main.csv
 ```
 
-142 individual CSVs plus 3 summaries. The per-trial CSVs are your raw
-data; the summaries are the paper's tables. Nothing else is needed
-from the session — no notebook, no photos (unless you want them for
-the presentation), no manual readings.
+15 individual CSVs plus 1 summary. The per-trial CSVs are your raw
+data; the summary is the paper's table. Nothing else is needed from
+the session — no notebook, no photos (unless you want them for the
+presentation), no manual readings.
 
 ---
 
@@ -303,9 +243,9 @@ FP needs a reasonable starting depth / view to lock onto.
 ### Depth calibration drifts (EKF errors seem systematically wrong)
 
 Pause, re-run the depth calibration step (Step 0.4). Update the
-`depth_scale` value in the trials YAML files:
+`depth_scale` value in the trials YAML file:
 ```bash
-sed -i 's/depth_scale: [0-9.]*/depth_scale: 0.001456/' experiments/trials_*.yaml
+sed -i 's/depth_scale: [0-9.]*/depth_scale: 0.001456/' experiments/trials_main.yaml
 ```
 Then resume.
 
@@ -322,14 +262,12 @@ Then typing `home` before each ENTER guarantees consistency.
 ## What to bring on session day
 
 - This protocol document, printed or on a laptop beside the GPU box.
-- Masking tape + ruler for object positions.
-- A side lamp (for the dim_light condition).
-- A second similar-colored box (for the distractor condition).
-- A phone for the occlusion condition (easier than using your hand
-  since the hand stays in camera view).
-- An hour and a half of uninterrupted time.
+- Masking tape + ruler for the single P1 object position.
+- The five target objects (Cheez-It, tissue, cardboard shipping,
+  protein bar, brownie mix).
+- ~45 minutes of uninterrupted time.
 
 Good luck. The framework is set up so that if each trial takes 30
-seconds of arm time, the whole session is 70 minutes of arm time plus
-~30 min of resets and troubleshooting. Plan for 2 hours total in the
-lab.
+seconds of arm time, the whole session is ~8 minutes of arm time
+plus ~20 min of resets and troubleshooting. Plan for ~30 minutes
+total in the lab.

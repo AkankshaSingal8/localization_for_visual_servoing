@@ -52,7 +52,7 @@ Carnegie Mellon University\\
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \begin{abstract}
-Robust visual servoing is critical for autonomous manipulation in unstructured environments such as warehouses and homes. Visual servoing requires accurate estimation of the relative pose between the robot end-effector and the target grasp point. We compare three approaches to pose estimation in an iterative visual servoing loop on real hardware: (i) a raw IBVS baseline that drives a calibrated image Jacobian directly from per-frame centroids, (ii) an EKF-filtered PBVS pipeline that fuses a learning-based perception front-end (DINOv2 + SAM2 + Depth Anything V2) into a temporally smoothed 3D position, and (iii) an EKF-filtered PBVS pipeline backed by FoundationPose for direct 6-DoF pose measurements. All three share the same xArm 7 manipulator, ZED Mini eye-in-hand camera, and per-frame CSV metrics logger, so differences are attributable to the perception/estimator stack. We describe the system architecture, the EKF formulation (including a Joseph-form covariance update, egomotion compensation, and a 2D-only partial-update fallback), and the experimental protocol used to quantify convergence speed, trajectory straightness, final error, and robustness under occlusion and lighting changes. Preliminary results are reported in <PLACEHOLDER> tables and will be updated once the full hardware sessions are complete.
+Robust visual servoing is critical for autonomous manipulation in unstructured environments such as warehouses and homes. Visual servoing requires accurate estimation of the relative pose between the robot end-effector and the target grasp point. We compare three approaches to pose estimation in an iterative visual servoing loop on real hardware: (i) a raw IBVS baseline that drives a calibrated image Jacobian directly from per-frame centroids, (ii) an EKF-filtered PBVS pipeline that fuses a learning-based perception front-end (DINOv2 + SAM2 + Depth Anything V2) into a temporally smoothed 3D position, and (iii) an EKF-filtered PBVS pipeline backed by FoundationPose for direct 6-DoF pose measurements. All three share the same xArm 7 manipulator, ZED Mini eye-in-hand camera, and per-frame CSV metrics logger, so differences are attributable to the perception/estimator stack. We describe the system architecture, the EKF formulation (including a Joseph-form covariance update, egomotion compensation, and a 2D-only partial-update fallback), and the experimental protocol used to quantify convergence speed, trajectory straightness, and final error across five box-shaped target objects from a single canonical start pose. The evaluation is organized as three per-pipeline experiments (one per pipeline), each sweeping the same five objects, for a total of fifteen hardware trials. Preliminary results are reported in <PLACEHOLDER> tables and will be updated once the hardware session is complete.
 \end{abstract}
 
 
@@ -251,33 +251,30 @@ From the per-frame CSV logs we compute, per trial: \textbf{final position error}
 
 \subsection{Experimental Protocol}
 
-We run three seperate experiments, all driven by the same batch runner described below.
+Our evaluation is organized as three per-pipeline experiments. Each experiment runs one pipeline across the same five target objects from a single canonical start pose (P1, centered on the optical axis at $\sim$50\,cm), for five trials per experiment and fifteen trials in total:
+\begin{itemize}
+\item \textbf{Experiment 1:} Pipeline A (IBVS) over 5 objects.
+\item \textbf{Experiment 2:} Pipeline B (EKF + DINOv2/SAM2/DepthAnything) over 5 objects.
+\item \textbf{Experiment 3:} Pipeline C (EKF + FoundationPose) over 5 objects.
+\end{itemize}
+The five objects are a Cheez-It box, a tissue box, a cardboard shipping box, a protein bar box, and a brownie mix box. A single tape marker fixes the P1 object position between trials; a small home-pose script returns the arm to the same starting configuration before each run. Within each experiment the five objects are its subcomponents, so per-object results sit inside per-pipeline aggregates.
 
-\textbf{Experiment 1: main three-way comparison.}
-Five target objects $\times$ three start poses (P1 centered at $\sim$50\,cm, P2 20$^\circ$ to the left, P3 15$^\circ$ elevated) $\times$ three pipelines (A/B/C) $\times$ two trials per cell = 90 runs. The five objects are a Cheez-It box, a tissue box, a cardboard shipping box, a protein bar box, and a brownie mix box. Tape markers on the table fix the object positions between trials; a small home-pose script returns the arm to the same starting configuration before each run.
-
-\textbf{Experiment 2: robustness.}
-Cheez-It box at P1 $\times$ four conditions (baseline, partial occlusion, dim lighting, near-identical distractor box) $\times$ three pipelines $\times$ three trials per cell = 36 runs. For the occlusion condition, a hand-held occluder briefly covers $\sim$30\% of the object around 5\,s into each trial; for the distractor condition, a second box of similiar color is placed 15\,cm to the left of the target; for dim lighting, only a single side lamp is active.
-
-\textbf{Experiment 3: Q/R sensitivity.}
-Cheez-It box at P1, Pipeline B only, sweeping the EKF process noise $\sigma_{\text{pos}}$ over $\{0.005, 0.010, 0.020, 0.050\}$\,m/s and the measurement noise $\sigma_{uv}$ over $\{3, 6, 12, 24\}$\,pixels, giving 16 combinations at one trial each.
-
-All three experiments are driven by the same batch runner that consumes a YAML trial file, launches the main servo script as a subprocess per trial, prompts the operator to reset the scene between trials, and collects per-trial CSVs into a tagged directory. Post-hoc, a single analyzer script walks the CSV directory and emits the results tables used in Section~\ref{sec:results}.
+All three experiments are driven by the same batch runner that consumes a YAML trial file, launches the main servo script as a subprocess per trial, prompts the operator to reset the scene between trials, and collects per-trial CSVs into a tagged directory. Post-hoc, a single analyzer script walks the CSV directory and emits the results tables used in Section~\ref{sec:results}. Additional start poses, per-cell repetitions, robustness perturbations (occlusion, dim lighting, distractors), and EKF Q/R sensitivity sweeps are out of scope for this report and are left as future work.
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \section{RESULTS}
 \label{sec:results}
 
-All three experiments have been prepared end-to-end on the lab's GPU workstation, and the per-trial YAML files plus the automated batch runner are in place. The full hardware session has not yet been executed at the time of writing, so numbers in this section are shown as \texttt{<PLACEHOLDER>} entries that will be filled in from the analyzer CSVs as soon as the session completes. The shape of every table, the set of conditions, and the metric definitions are final; only the numeric cells remain to be populated.
+All three experiments have been prepared end-to-end on the lab's GPU workstation, and the per-trial YAML file plus the automated batch runner are in place. The full hardware session has not yet been executed at the time of writing, so numbers in this section are shown as \texttt{<PLACEHOLDER>} entries that will be filled in from the analyzer CSVs as soon as the session completes. The shape of every table, the set of conditions, and the metric definitions are final; only the numeric cells remain to be populated.
 
-\subsection{Main Three-Way Comparison (Experiment 1)}
+\subsection{Per-Pipeline Three-Way Comparison}
 
-Table~\ref{tab:exp1_main} reports the aggregate convergence statistics across the five objects and three start poses, grouped by pipeline. The ``pass-rate'' columns give the fraction of trials that reached the given tolerance within the trial window. The ``final error'' column is the median across trials.
+Table~\ref{tab:exp1_main} reports the aggregate convergence statistics across the five objects, grouped by pipeline (one experiment per row). The ``pass-rate'' columns give the fraction of the five per-pipeline trials that reached the given tolerance within the trial window. The ``final error'' column is the median across the five objects.
 
 \begin{table}[h]
 \centering
-\caption{Main comparison across 5 objects $\times$ 3 start poses $\times$ 3 pipelines $\times$ 2 trials ($n = 90$).}
+\caption{Per-pipeline three-way comparison across 5 objects at the P1 start pose (3 experiments $\times$ 5 objects, $n = 15$).}
 \label{tab:exp1_main}
 \footnotesize
 \begin{tabular}{@{}lccccc@{}}
@@ -296,7 +293,7 @@ Table~\ref{tab:exp1_runtime} reports the median wall-clock runtime per iteration
 
 \begin{table}[h]
 \centering
-\caption{Median per-iteration runtime (ms), Experiment 1.}
+\caption{Median per-iteration runtime (ms), per pipeline.}
 \label{tab:exp1_runtime}
 \footnotesize
 \begin{tabular}{@{}lcccc@{}}
@@ -310,53 +307,7 @@ C (EKF + FoundationPose) & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} & \text
 \end{tabular}
 \end{table}
 
-For Pipeline C, the raw FoundationPose translation sequence is logged alongside the EKF-filtered state. The jitter metric (standard deviation of frame-to-frame raw-pose change during the last 2\,s of each trial) is \texttt{<PLACEHOLDER>}\,mm; the same quantity computed on the EKF-filtered state is \texttt{<PLACEHOLDER>}\,mm, which quantifies how much of the raw per-frame noise the filter absorbs.
-
-\subsection{Robustness (Experiment 2)}
-
-Table~\ref{tab:exp2_robustness} reports per-condition pass rates at the 1\,cm tolerance across the four perturbations, using the Cheez-It box at P1 and three trials per cell.
-
-\begin{table}[h]
-\centering
-\caption{Robustness pass rate ($\%$, $\leq 1$\,cm) by condition, Experiment 2 ($n = 36$).}
-\label{tab:exp2_robustness}
-\footnotesize
-\begin{tabular}{@{}lcccc@{}}
-\toprule
-Pipeline & Baseline & Occlusion & Dim light & Distractor \\
-\midrule
-A (IBVS)                 & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} \\
-B (EKF + DINOv2)         & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} \\
-C (EKF + FoundationPose) & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-The occlusion condition is of particular interest: during the 2\,s window when the object is covered, the EKF should continue propagating the state under the constant-velocity model with growing covariance, and IBVS (which has no such prediction) should either stall or drift. A qualitative EKF-uncertainty trace accross the occlusion window will be included in the final version of this section once the run is complete: \texttt{<PLACEHOLDER: occlusion uncertainty trace plot>}.
-
-\subsection{Q/R Sensitivity (Experiment 3)}
-
-Table~\ref{tab:exp3_qr} reports median final error for Pipeline B across the $4 \times 4$ sweep of process noise $\sigma_{\text{pos}}$ and measurement noise $\sigma_{uv}$. The nominal operating point is the $(0.01, 6)$ cell.
-
-\begin{table}[h]
-\centering
-\caption{Median final error (cm) across Q/R sweep, Pipeline B, Experiment 3 ($n = 16$).}
-\label{tab:exp3_qr}
-\footnotesize
-\begin{tabular}{@{}lcccc@{}}
-\toprule
- & \multicolumn{4}{c}{$\sigma_{uv}$ (px)} \\
-$\sigma_{\text{pos}}$ (m/s) & 3 & 6 & 12 & 24 \\
-\midrule
-0.005 & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} \\
-0.010 & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} \\
-0.020 & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} \\
-0.050 & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-We expect a valley shape: too little process noise makes the filter overconfident and slow to respond to object motion, while too much process noise makes the filter effectively pass-through and loses the smoothing benefit. \texttt{<PLACEHOLDER: final heatmap interpretation>}.
+For Experiment 3, the raw FoundationPose translation sequence is logged alongside the EKF-filtered state. The jitter metric (standard deviation of frame-to-frame raw-pose change during the last 2\,s of each trial, averaged over the five per-object trials) is \texttt{<PLACEHOLDER>}\,mm; the same quantity computed on the EKF-filtered state is \texttt{<PLACEHOLDER>}\,mm, which quantifies how much of the raw per-frame noise the filter absorbs.
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -370,11 +321,8 @@ The A-vs-B comparison isolates this: same perception front-end, with and without
 \textbf{Does FoundationPose add enough to justify its cost?}
 The B-vs-C comparison asks whether a dedicated 6-DoF pose model is worth the extra dependency (CAD mesh, real stereo depth, heavier GPU refiner). If raw-pose jitter is already small ($\sim$1--2\,mm), the EKF has little to smooth and Pipeline C pays runtime for no gain. If it is larger ($\sim$5--15\,mm, as occured on darker or more reflective boxes in our sanity checks), the filter should recover it and C should win. The jitter metric reported with Table~\ref{tab:exp1_main} is the most diagnostic single number.
 
-\textbf{Robustness.}
-We expect IBVS to fail most noticably under the distractor condition because a single off-target centroid drives the arm the wrong way immediately, while Pipeline B's EKF softens the hit. Under occlusion, the filter should coast on the constant-velocity model through the 2\,s blackout while IBVS stalls or chatters. Dim lighting mostly stresses perception quality, so we expect Pipeline C to dominate there.
-
 \textbf{Limitations.}
-Our comparison holds the PBVS controller fixed across pipelines B and C, so we cannot cleanly attribute any Pipeline C advantage to FoundationPose itself versus a controller better-tuned to its input distribution. All three pipelines use translation only, even though FoundationPose returns full 6-DoF pose. And the five targets are all roughly box-shaped, so our results speak to rigid rectangular objects rather than to deformable or highly non-convex ones. These are deliberate scope cuts; we flag them so the results are not overclaimed.
+Our comparison holds the PBVS controller fixed across pipelines B and C, so we cannot cleanly attribute any Pipeline C advantage to FoundationPose itself versus a controller better-tuned to its input distribution. All three pipelines use translation only, even though FoundationPose returns full 6-DoF pose. The five targets are all roughly box-shaped, so our results speak to rigid rectangular objects rather than to deformable or highly non-convex ones. With $n = 15$ total trials (one run per object per pipeline, single start pose P1, no per-cell repetitions), the study is a baseline characterization rather than a statistically powered comparison: cross-pipeline deltas smaller than the per-trial run-to-run variance should not be over-read, and broader start-pose coverage plus repeats are left as future work. Likewise, explicit robustness stressors (occlusion, dim lighting, distractors) and EKF process/measurement-noise sensitivity sweeps are out of scope here. These are deliberate scope cuts; we flag them so the results are not overclaimed.
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%

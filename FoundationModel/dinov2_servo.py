@@ -1411,7 +1411,7 @@ if __name__ == "__main__":
                         help="Re-run registration every N frames (0 = never).")
     parser.add_argument("--fp-meas-noise", type=float, default=0.008,
                         help="EKF measurement stddev for FP 3D position (m).")
-    # EKF tuning (for Q/R sensitivity sweep)
+    # EKF tuning knobs
     parser.add_argument("--process-noise-pos", type=float, default=0.01,
                         help="EKF process-noise stddev on position (m).")
     parser.add_argument("--process-noise-vel", type=float, default=0.1,
