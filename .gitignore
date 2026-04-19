@@ -22,7 +22,13 @@ env/
 checkpoints/
 
 # Third-party dependencies (submodules / cloned repos)
+# The four repos under third-party/ are registered as git submodules.
+# The lines below ignore downloaded weights and checkpoints inside them.
 FoundationModel/third-party/
+third-party/Depth-Anything-V2/checkpoints/
+third-party/GroundingDINO/weights/
+third-party/sam2/checkpoints/
+third-party/sam3/checkpoints/
 
 # Depth-Anything / GroundingDINO / SAM2 weights
 weights/
