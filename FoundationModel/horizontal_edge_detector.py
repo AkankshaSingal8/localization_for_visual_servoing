@@ -19,7 +19,9 @@ import tempfile
 import cv2
 import numpy as np
 
-THIRD_PARTY_ROOT = os.path.join(os.path.dirname(__file__), "third-party")
+THIRD_PARTY_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "third-party")
+)
 
 PROMPT = "brown box"
 

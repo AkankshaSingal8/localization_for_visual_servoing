@@ -19,7 +19,9 @@ import argparse
 import cv2
 import numpy as np
 
-THIRD_PARTY_ROOT = os.path.join(os.path.dirname(__file__), "third-party")
+THIRD_PARTY_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "third-party")
+)
 SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 SAM2_CKPT = os.path.join(THIRD_PARTY_ROOT, "sam2/checkpoints/sam2.1_hiera_large.pt")
 
@@ -280,6 +282,10 @@ def similarity_to_bbox(
     bbox : (x1, y1, x2, y2) in original scene image coordinates
     binary_mask : (scene_h, scene_w) thresholded similarity mask (for debug)
     sim_upscaled : (scene_h, scene_w) upscaled similarity heatmap
+    mean_sim : mean similarity of the selected connected component,
+               or -1.0 if the peak-fallback path was taken. Callers can
+               use this to reject low-confidence DINOv2 matches before
+               paying the SAM2 cost.
     """
     # Upscale similarity map to original resolution
     sim_upscaled = cv2.resize(
@@ -290,15 +296,29 @@ def similarity_to_bbox(
     thresh_val = np.percentile(sim_upscaled, threshold_percentile)
     binary = (sim_upscaled >= thresh_val).astype(np.uint8) * 255
 
-    # Morphological cleanup
-    kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kern, iterations=2)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kern, iterations=1)
+    # Morphological cleanup.
+    # Previously we ran a 15x15 CLOSE with 2 iterations (~30 px of gap
+    # bridging) followed by a 15x15 OPEN. The aggressive CLOSE was fine
+    # for a single object but *fused two stacked identical boxes* into
+    # a single connected component, defeating the CC-based instance
+    # picker below. A smaller CLOSE still fills the sub-patch holes
+    # that DINOv2 leaves inside one object (patches are 14 px so any
+    # hole inside an instance is much smaller than that), without
+    # bridging across the physical seam between two adjacent
+    # instances. We run OPEN first to strip isolated patch-sized
+    # specks, then a mild CLOSE for hole-filling.
+    kern_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    kern_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  kern_open,  iterations=1)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kern_close, iterations=1)
 
-    # Find connected components and pick the one with highest mean similarity
-    # (not just the largest by area — that can merge multiple similar objects)
-    n_cc, labels, stats, centroids = cv2.connectedComponentsWithStats(binary)
-    if n_cc <= 1:
+    # Find connected components and rank them by mean similarity. Break
+    # ties (|Δ| ≤ 0.02) by picking the topmost (smallest y_min), which
+    # handles identical stacked objects where DINOv2 scores every
+    # instance equally and the operator put the reference on top.
+    pick = select_best_cc_by_similarity(
+        binary, sim_upscaled, min_area_frac=0.002, sim_tie_eps=0.02)
+    if pick is None:
         # Fallback: use the peak region
         print("WARNING: no connected component found, using peak location")
         peak = np.unravel_index(np.argmax(sim_upscaled), sim_upscaled.shape)
@@ -307,34 +327,28 @@ def similarity_to_bbox(
         return (
             max(0, cx - pad), max(0, cy - pad),
             min(scene_w, cx + pad), min(scene_h, cy + pad),
-        ), binary, sim_upscaled
+        ), binary, sim_upscaled, -1.0
 
-    # Score each component by mean similarity (not just area)
-    best_cc = 1
-    best_score = -1.0
-    min_area = 0.002 * scene_h * scene_w  # ignore tiny components
-    for cc_id in range(1, n_cc):
-        area = stats[cc_id, cv2.CC_STAT_AREA]
-        if area < min_area:
-            continue
-        cc_mask = labels == cc_id
-        mean_sim = float(np.mean(sim_upscaled[cc_mask]))
-        if mean_sim > best_score:
-            best_score = mean_sim
-            best_cc = cc_id
-    print(f"  Selected component {best_cc} with mean similarity {best_score:.3f}")
+    if pick["n_candidates"] > 1:
+        print(
+            f"  DINOv2 picker: {pick['n_candidates']} CCs → "
+            f"mean_sim={pick['mean_sim']:.3f}"
+            f"{' (topmost-tiebreak)' if pick['tiebreak_used'] else ''}"
+            f"; dropped sims={[round(s, 3) for s in pick['other_mean_sims']]}"
+        )
+    else:
+        print(f"  Selected component with mean similarity {pick['mean_sim']:.3f}")
 
-    comp_mask = (labels == best_cc).astype(np.uint8) * 255
-
-    x, y, bw, bh, _ = stats[best_cc]
+    comp_mask = pick["mask"]
+    x1, y1, x2, y2 = pick["bbox"]
     # Add padding
     pad = 15
-    x1 = max(0, x - pad)
-    y1 = max(0, y - pad)
-    x2 = min(scene_w, x + bw + pad)
-    y2 = min(scene_h, y + bh + pad)
+    x1 = max(0, x1 - pad)
+    y1 = max(0, y1 - pad)
+    x2 = min(scene_w, x2 + pad)
+    y2 = min(scene_h, y2 + pad)
 
-    return (x1, y1, x2, y2), comp_mask, sim_upscaled
+    return (x1, y1, x2, y2), comp_mask, sim_upscaled, pick["mean_sim"]
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -353,6 +367,103 @@ def _get_sam2():
         _sam2_pred = SAM2ImagePredictor(model)
         print(f"SAM2 loaded on {DEVICE}")
     return _sam2_pred
+
+
+def select_best_cc_by_similarity(
+    mask: np.ndarray,
+    sim_upscaled: np.ndarray,
+    min_area_frac: float = 0.002,
+    sim_tie_eps: float = 0.02,
+):
+    """
+    Pick the connected component of ``mask`` that best matches the DINOv2
+    reference, using ``sim_upscaled`` as the per-pixel similarity signal.
+
+    Designed for stacked / multi-instance scenes where SAM2's bbox prompt
+    can segment several similar objects as one mask. Splitting by CC and
+    ranking by DINOv2 similarity isolates the true target instance.
+
+    Scoring
+    -------
+    * Primary  -- highest mean DINOv2 similarity inside the component.
+    * Tiebreak -- when one or more runners-up are within ``sim_tie_eps``
+                  of the leader, pick the topmost (smallest ``y_min``).
+                  Handles the identical-boxes-stacked case where every
+                  instance matches the reference equally well.
+
+    Parameters
+    ----------
+    mask         : (H, W) uint8 binary mask (0/255) — SAM2 output.
+    sim_upscaled : (H, W) float DINOv2 similarity map already upscaled
+                   to scene resolution.
+    min_area_frac: ignore components smaller than this fraction of the
+                   frame area (filters specular / texture noise).
+    sim_tie_eps  : two CCs are considered tied when their mean similarity
+                   differs by less than this.
+
+    Returns
+    -------
+    dict or None
+        ``None`` when the input mask has no qualifying components. Else
+        a dict with::
+            mask           -- uint8 mask of the winning CC only.
+            bbox           -- (x1, y1, x2, y2) of the winning CC.
+            mean_sim       -- DINOv2 mean similarity of the winner.
+            area, y_min    -- winner geometry.
+            n_candidates   -- number of CCs that passed ``min_area_frac``.
+            tiebreak_used  -- whether the topmost-y_min tiebreak fired.
+            other_mean_sims-- mean similarities of the dropped CCs, for
+                              logging.
+    """
+    if mask is None:
+        return None
+    h, w = mask.shape[:2]
+    n_cc, labels, stats, _ = cv2.connectedComponentsWithStats(
+        (mask > 0).astype(np.uint8), connectivity=8)
+    if n_cc <= 1:
+        return None
+
+    min_area = int(min_area_frac * h * w)
+    candidates = []
+    for cc_id in range(1, n_cc):
+        area = int(stats[cc_id, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        cc_mask = labels == cc_id
+        mean_sim = float(np.mean(sim_upscaled[cc_mask]))
+        y_min = int(stats[cc_id, cv2.CC_STAT_TOP])
+        x_min = int(stats[cc_id, cv2.CC_STAT_LEFT])
+        bw = int(stats[cc_id, cv2.CC_STAT_WIDTH])
+        bh = int(stats[cc_id, cv2.CC_STAT_HEIGHT])
+        candidates.append(dict(
+            cc_id=cc_id, area=area, mean_sim=mean_sim,
+            y_min=y_min,
+            bbox=(x_min, y_min, x_min + bw, y_min + bh),
+        ))
+
+    if not candidates:
+        return None
+
+    best_sim = max(c["mean_sim"] for c in candidates)
+    top_tier = [c for c in candidates
+                if best_sim - c["mean_sim"] <= sim_tie_eps]
+    winner = min(top_tier, key=lambda c: c["y_min"])
+
+    winner_mask = (labels == winner["cc_id"]).astype(np.uint8) * 255
+    other_sims = sorted(
+        (c["mean_sim"] for c in candidates if c["cc_id"] != winner["cc_id"]),
+        reverse=True,
+    )
+    return dict(
+        mask=winner_mask,
+        bbox=winner["bbox"],
+        mean_sim=winner["mean_sim"],
+        area=winner["area"],
+        y_min=winner["y_min"],
+        n_candidates=len(candidates),
+        tiebreak_used=(len(top_tier) > 1 and len(candidates) > 1),
+        other_mean_sims=list(other_sims),
+    )
 
 
 def _select_topmost_mask(mask: np.ndarray) -> np.ndarray:
@@ -748,7 +859,7 @@ def main():
 
     # ── Step 3: Extract bounding box from similarity ─────────────────
     print("\n--- Step 3: Extracting bounding box ---")
-    bbox, dinov2_binary, sim_upscaled = similarity_to_bbox(
+    bbox, dinov2_binary, sim_upscaled, _sim_mean = similarity_to_bbox(
         sim_map, sh, sw, patch_size, args.threshold_pct,
     )
     print(f"  DINOv2+Color bbox: {bbox}")

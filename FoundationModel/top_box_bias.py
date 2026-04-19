@@ -35,7 +35,9 @@ import argparse
 import cv2
 import numpy as np
 
-THIRD_PARTY_ROOT = os.path.join(os.path.dirname(__file__), "third-party")
+THIRD_PARTY_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "third-party")
+)
 
 SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 SAM2_CKPT   = os.path.join(THIRD_PARTY_ROOT, "sam2/checkpoints/sam2.1_hiera_large.pt")

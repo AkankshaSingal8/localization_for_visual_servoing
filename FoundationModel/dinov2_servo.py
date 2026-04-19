@@ -18,11 +18,13 @@ Usage:
         [--no-pyzed] [--no-robot]
 """
 import csv
+import json
 import logging
 import time
 import sys
 import threading
 import os
+from datetime import datetime
 
 import cv2
 import numpy as np
@@ -37,7 +39,67 @@ if not logger.handlers:
     logger.addHandler(_handler)
     logger.setLevel(logging.DEBUG)
 
-THIRD_PARTY_ROOT = os.path.join(os.path.dirname(__file__), "third-party")
+THIRD_PARTY_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "third-party")
+)
+
+# ── Depth calibration persistence ────────────────────────────────────
+# When the user presses 'c' (or when --depth-scale is explicitly passed),
+# we write the resulting scale+offset to this JSON file so that the next
+# run can pick it up automatically without a copy-paste dance. smoke_ekf.sh
+# reads this same file as a fallback when DEPTH_SCALE is not set.
+DEPTH_SCALE_STATE_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "experiments",
+                 "depth_scale.json")
+)
+
+
+def _save_depth_scale_state(scale, offset, depth_cal_m, d_rel_median=None,
+                            reference=None, source="keypress_c"):
+    """Persist the depth calibration to DEPTH_SCALE_STATE_PATH.
+
+    Writes atomically (tmp + rename) so a concurrent reader can never
+    see a half-written file. Failures are logged but not raised — a
+    disk-write error should not take down a live servo loop.
+    """
+    payload = {
+        "scale": float(scale),
+        "offset": float(offset),
+        "depth_cal_m": float(depth_cal_m),
+        "d_rel_median": float(d_rel_median) if d_rel_median is not None else None,
+        "reference": reference,
+        "source": source,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        os.makedirs(os.path.dirname(DEPTH_SCALE_STATE_PATH), exist_ok=True)
+        tmp = DEPTH_SCALE_STATE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, DEPTH_SCALE_STATE_PATH)
+        logger.info("Depth calibration saved to %s", DEPTH_SCALE_STATE_PATH)
+    except OSError as exc:
+        logger.warning("Could not save depth calibration to %s: %s",
+                       DEPTH_SCALE_STATE_PATH, exc)
+
+
+def _load_depth_scale_state(path=DEPTH_SCALE_STATE_PATH):
+    """Read a previously saved calibration. Returns dict or None."""
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        if "scale" not in data:
+            logger.warning("Depth-scale file %s is missing 'scale'; ignoring.",
+                           path)
+            return None
+        return data
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not read depth calibration from %s: %s",
+                       path, exc)
+        return None
 
 # ── Import DINOv2 matching pipeline ──────────────────────────────────
 from dinov2_match_segment import (
@@ -47,6 +109,7 @@ from dinov2_match_segment import (
     combine_similarity_maps,
     similarity_to_bbox,
     refine_with_sam2,
+    select_best_cc_by_similarity,
 )
 
 # ── Import infrastructure from negative_weighing ────────────────────
@@ -86,6 +149,26 @@ from ekf_servo import PoseEKF, PBVSController, CameraIntrinsics, DepthScaler
 DINOV2_THRESHOLD_PCT = 93      # percentile for similarity thresholding
 DINOV2_COLOR_WEIGHT  = 0.7     # weight for color vs DINOv2 features
 DINOV2_REDETECT_INTERVAL = 30  # re-run DINOv2 every N frames
+# Reject SAM2 masks that cover more of the frame than this. A mask that
+# hugs a single tabletop object is typically <20% of HD720. Anything
+# >35% is almost always SAM2 having segmented the wall/desk instead of
+# the target (see PROGRESS.md — 2026-04-18 mask-drift debug).
+DINOV2_MASK_MAX_FRAC = 0.35
+# Re-detection sanity checks (see PROGRESS.md — 2026-04-18 wrong-location
+# debug). After the mask-area guard still, DINOv2 can pick the wrong 8%
+# blob: a different textured patch (wall, monitor, poster) that happens
+# to pass the 93rd-percentile similarity threshold. Two guards below:
+#
+# * DINOV2_SIM_MIN_REDETECT — once an anchor is already locked, require
+#   the winning connected-component mean similarity to exceed this. A
+#   real Cheez-It / reference-object match typically produces ≥0.80;
+#   ~0.70 means "the best of many mediocre candidates".
+# * DINOV2_MAX_CENTROID_JUMP_PX — if the freshly-detected centroid is
+#   more than this far from the previous anchor centroid, reject the
+#   redetect. Real tabletop targets cannot teleport half a frame in
+#   one second. 250 px ≈ 1/5 of an HD720 frame width.
+DINOV2_SIM_MIN_REDETECT       = 0.78
+DINOV2_MAX_CENTROID_JUMP_PX   = 250
 PATCH_SIZE = 14
 
 # ── Camera-to-robot mount rotation presets ──────────────────────────
@@ -172,6 +255,11 @@ class ReferenceModel:
         sam_score : float
         sim_upscaled : (H, W) similarity heatmap
         sam_logits : (1, 256, 256) low-res SAM2 logits, or None
+        dinov2_sim_mean : float
+            Mean similarity of the DINOv2 connected component the bbox
+            was drawn from. -1.0 if no component was found (peak
+            fallback). Callers can gate re-detection on this to avoid
+            accepting low-confidence matches that teleport the anchor.
         """
         sh, sw = scene_bgr.shape[:2]
 
@@ -189,21 +277,49 @@ class ReferenceModel:
             dinov2_sim, resnet_sim,
             alpha=1.0 - DINOV2_COLOR_WEIGHT)
 
-        bbox, _, sim_upscaled = similarity_to_bbox(
+        bbox, _, sim_upscaled, sim_mean = similarity_to_bbox(
             sim_map, sh, sw, PATCH_SIZE, DINOV2_THRESHOLD_PCT)
 
-        logger.info("DINOv2 bbox: %s", bbox)
+        logger.info("DINOv2 bbox: %s, component mean-sim: %.3f",
+                    bbox, sim_mean)
 
         if bbox is None:
-            return None, None, 0.0, sim_upscaled, None
+            return None, None, 0.0, sim_upscaled, None, sim_mean
 
         sam_mask, sam_score, sam_logits = refine_with_sam2(
-            scene_bgr, bbox, return_logits=True)
+            scene_bgr, bbox, select_topmost=False, return_logits=True)
+
+        # ── Post-SAM2 multi-instance filter ───────────────────────────
+        # When the scene has several similar objects (classic failure
+        # case: two identical boxes stacked with the reference on top),
+        # SAM2's bbox prompt can segment them all as one mask. We split
+        # by connected components and keep only the CC whose mean DINOv2
+        # similarity is highest. If two CCs are effectively tied (within
+        # 0.02) we break the tie by picking the topmost one — the right
+        # call when both components are truly the same object type.
+        #
+        # On a hit we re-run SAM2 with the winning CC's tight bbox so
+        # that the returned low-res logits match the filtered mask.
+        # Those logits feed SAM2 temporal propagation on the next frame;
+        # stale logits would quietly re-introduce the dropped CCs.
+        cc_pick = select_best_cc_by_similarity(sam_mask, sim_upscaled)
+        if cc_pick is not None and cc_pick["n_candidates"] > 1:
+            logger.info(
+                "SAM2 multi-CC filter: %d qualifying CCs → kept 1 "
+                "(mean_sim=%.3f area=%d y_min=%d%s); dropped sims=%s",
+                cc_pick["n_candidates"], cc_pick["mean_sim"],
+                cc_pick["area"], cc_pick["y_min"],
+                " via topmost-tiebreak" if cc_pick["tiebreak_used"] else "",
+                [round(s, 3) for s in cc_pick["other_mean_sims"]])
+            bbox = cc_pick["bbox"]
+            sam_mask, sam_score, sam_logits = refine_with_sam2(
+                scene_bgr, bbox, select_topmost=False, return_logits=True)
+
         mask_area = np.count_nonzero(sam_mask)
         logger.info("SAM2 mask: score=%.3f, area=%dpx (%.1f%%)",
                      sam_score, mask_area, 100.0 * mask_area / (sh * sw))
 
-        return bbox, sam_mask, sam_score, sim_upscaled, sam_logits
+        return bbox, sam_mask, sam_score, sim_upscaled, sam_logits, sim_mean
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -239,22 +355,73 @@ def run_dinov2_pipeline(
     if need_detection:
         logger.info("--- Running DINOv2 detection ---")
         res["mode"] = "detect"
-        bbox, sam_mask, sam_score, sim_upscaled, sam_logits = \
+        bbox, sam_mask, sam_score, sim_upscaled, sam_logits, sim_mean = \
             ref_model.detect_in_scene(image_bgr)
         res["bbox"] = bbox
 
-        if sam_mask is not None and sam_score > 0.5:
+        mask_frac = (
+            np.count_nonzero(sam_mask) / float(h * w)
+            if sam_mask is not None else 0.0
+        )
+
+        # Compute the candidate centroid once (only if we have a mask)
+        candidate_centroid = (
+            _robust_centroid(sam_mask) if sam_mask is not None else None
+        )
+
+        # ── Re-detection sanity guards ────────────────────────────────
+        # Only applied once we already have a locked anchor — the very
+        # first detection has nothing to compare against.
+        reject_reason = None
+        if sam_mask is None or sam_score <= 0.5:
+            reject_reason = "low SAM2 score or no mask"
+        elif mask_frac >= DINOV2_MASK_MAX_FRAC:
+            reject_reason = (
+                f"oversized mask ({100.0 * mask_frac:.1f}% of frame, "
+                f"max={100.0 * DINOV2_MASK_MAX_FRAC:.0f}%) — likely "
+                f"background/desk")
+        elif tracker.anchor_locked:
+            # Guard 1: DINOv2 similarity floor. sim_mean == -1.0 is the
+            # peak-fallback path (no connected component) — treat as
+            # low confidence.
+            if sim_mean < DINOV2_SIM_MIN_REDETECT:
+                reject_reason = (
+                    f"weak DINOv2 similarity ({sim_mean:.3f} < "
+                    f"{DINOV2_SIM_MIN_REDETECT:.2f}) — not confident "
+                    f"enough to overwrite locked anchor")
+            # Guard 2: teleport check against last known centroid.
+            elif (
+                tracker.prev_centroid is not None
+                and candidate_centroid is not None
+            ):
+                dx = candidate_centroid[0] - tracker.prev_centroid[0]
+                dy = candidate_centroid[1] - tracker.prev_centroid[1]
+                jump = float(np.hypot(dx, dy))
+                if jump > DINOV2_MAX_CENTROID_JUMP_PX:
+                    reject_reason = (
+                        f"centroid teleport ({jump:.0f}px > "
+                        f"{DINOV2_MAX_CENTROID_JUMP_PX}px) from "
+                        f"{tracker.prev_centroid} to "
+                        f"{candidate_centroid} — likely a spurious "
+                        f"match on background")
+
+        if reject_reason is None:
             res["mask_np"] = sam_mask
-            centroid = _robust_centroid(sam_mask)
-            res["best_centroid"] = centroid
+            res["best_centroid"] = candidate_centroid
 
             # Logits come directly from detect_in_scene (no second SAM2 call)
-            tracker.update(sam_mask, sam_logits, centroid)
-            logger.info(f"DINOv2 detection done. Centroid: {centroid}, "
-                        f"anchor_locked: {tracker.anchor_locked}")
+            tracker.update(sam_mask, sam_logits, candidate_centroid)
+            logger.info(
+                f"DINOv2 detection done. Centroid: {candidate_centroid}, "
+                f"sim_mean={sim_mean:.3f}, "
+                f"anchor_locked: {tracker.anchor_locked}")
         else:
-            logger.info("DINOv2 detection: low SAM2 score or no mask")
-            tracker.update(None, None, None)
+            logger.info("DINOv2 detection: rejected — %s", reject_reason)
+            # Do NOT call tracker.update(None, ...) on reject: that would
+            # wipe prev_logits / prev_centroid and cause the SAM2
+            # propagation path on the next frame to lose its prior.
+            # Leave the tracker state untouched and continue propagating
+            # from the existing (good) anchor.
 
         return res
 
@@ -498,6 +665,16 @@ class DINOv2CameraStreamer(threading.Thread):
         logger.info(
             "Depth calibrated at Z=%.3fm (d_rel=%.4f) -> scale=%.6f",
             self.depth_cal_m, d_rel_median, self._depth_scaler.scale)
+        # Persist so the next run can auto-load via smoke_ekf.sh without
+        # a copy-paste step. See DEPTH_SCALE_STATE_PATH docstring.
+        _save_depth_scale_state(
+            scale=self._depth_scaler.scale,
+            offset=self._depth_scaler.offset,
+            depth_cal_m=self.depth_cal_m,
+            d_rel_median=d_rel_median,
+            reference=getattr(self, "reference_path", None),
+            source="keypress_c",
+        )
         # Reset EKF so it re-initialises with the calibrated depth.
         self._full_reset()
 
@@ -665,6 +842,18 @@ class DINOv2CameraStreamer(threading.Thread):
                     res = self._run_foundationpose_step(frame, depth_m_frame)
                 else:
                     res = run_dinov2_pipeline(frame, self.ref_model, self._tracker)
+
+                # Carry the most recent monocular depth map forward across
+                # propagation frames. Depth inference only re-runs every 5
+                # frames (or on the first frame) — without this carry-over
+                # self._result["depth_np"] would be missing 4-out-of-5
+                # frames, which made the 'c' keypress calibration impossible
+                # to time. See _calibrate_depth() below.
+                with self.data_lock:
+                    prev_depth_np = (self._result.get("depth_np")
+                                     if self._result else None)
+                if prev_depth_np is not None:
+                    res["depth_np"] = prev_depth_np
 
                 # ── 2. EKF predict (always, even without measurement) ─
                 robot_vel_cam = (self._last_servo_vel_cam
@@ -1294,20 +1483,41 @@ if __name__ == "__main__":
         dead_zone_m=args.pbvs_dead_zone,
         R_cam_to_robot=R_cam_to_robot,
     )
-    # Depth scaler: if --depth-scale was supplied, skip the interactive
-    # calibration; otherwise start uncalibrated and warn the user.
+    # Depth scaler precedence:
+    #   1. Explicit --depth-scale on the CLI wins.
+    #   2. Otherwise try DEPTH_SCALE_STATE_PATH (written on last 'c').
+    #   3. Otherwise start uncalibrated and warn.
     if args.depth_scale is not None:
         depth_scaler = DepthScaler(default_scale=args.depth_scale,
                                    default_offset=args.depth_offset)
         depth_scaler.calibrated = True
-        logger.info("Depth scaler pre-calibrated: scale=%.6f offset=%.4f",
+        logger.info("Depth scaler pre-calibrated from CLI: "
+                    "scale=%.6f offset=%.4f",
                     args.depth_scale, args.depth_offset)
     else:
-        depth_scaler = DepthScaler(default_scale=0.001)
-        logger.warning(
-            "Depth scaler is UNCALIBRATED (default_scale=0.001). Place the "
-            "object at ~%.2fm and press 'c' to calibrate, or pass "
-            "--depth-scale <value>.", args.depth_cal_m)
+        saved = _load_depth_scale_state()
+        if saved is not None:
+            depth_scaler = DepthScaler(
+                default_scale=saved["scale"],
+                default_offset=saved.get("offset", 0.0),
+            )
+            depth_scaler.calibrated = True
+            logger.info(
+                "Depth scaler pre-calibrated from %s: scale=%.6f "
+                "offset=%.4f (captured %s at Z=%.3fm, ref=%s)",
+                DEPTH_SCALE_STATE_PATH,
+                saved["scale"], saved.get("offset", 0.0),
+                saved.get("saved_at", "?"),
+                saved.get("depth_cal_m", float("nan")),
+                saved.get("reference", "?"))
+        else:
+            depth_scaler = DepthScaler(default_scale=0.001)
+            logger.warning(
+                "Depth scaler is UNCALIBRATED (default_scale=0.001). Place "
+                "the object at ~%.2fm and press 'c' to calibrate, pass "
+                "--depth-scale <value>, or run "
+                "experiments/calibrate_depth.sh to populate %s.",
+                args.depth_cal_m, DEPTH_SCALE_STATE_PATH)
     logger.info(
         "EKF + PBVS initialised (cam_to_robot=%s, Q_pos=%.4f Q_vel=%.3f "
         "R_uv=%.2f R_z=%.4f gain=%.2f target_z=%.2fm)",
@@ -1330,6 +1540,7 @@ if __name__ == "__main__":
     cam_thread.depth_cal_m = args.depth_cal_m
     cam_thread.pipeline_mode = args.mode
     cam_thread.run_tag = args.run_tag
+    cam_thread.reference_path = args.reference
 
     if args.mode == "foundationpose":
         if args.fp_mesh is None and args.fp_box is None:
