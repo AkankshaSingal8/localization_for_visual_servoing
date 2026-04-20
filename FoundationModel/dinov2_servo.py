@@ -584,7 +584,8 @@ class DINOv2CameraStreamer(threading.Thread):
 
         # Metrics CSV logger
         ts = time.strftime("%Y%m%d_%H%M%S")
-        self._csv_path = os.path.abspath(f"metrics_{ts}.csv")
+        self._out_prefix_str = (args.out_prefix + "_") if getattr(args, "out_prefix", "") else ""
+        self._csv_path = os.path.abspath(f"metrics_{self._out_prefix_str}{ts}.csv")
         self._csv_file = open(self._csv_path, "w", newline="")
         self._csv_writer = csv.writer(self._csv_file)
         self._csv_writer.writerow([
@@ -601,11 +602,52 @@ class DINOv2CameraStreamer(threading.Thread):
             # post-hoc we can measure how much the filter damped the
             # input jitter. Empty in non-FP modes.
             "fp_raw_x", "fp_raw_y", "fp_raw_z",
+            # IBVS-only: pixel-space centroid error magnitude from the
+            # image centre. Always empty for 'ekf' / 'foundationpose'
+            # rows since those pipelines operate on metric errors
+            # recorded in err_m.
+            "err_px",
         ])
         self._frame_idx = 0
         self._last_servo_cmd = (0.0, 0.0, 0.0, 0.0)  # dx, dy, dz, err
+        # IBVS-only pixel error (px), mirrored from the IBVS controller
+        # each frame so the CSV logger can emit it under err_px. 0 for
+        # non-IBVS rows.
+        self._last_ibvs_err_px = 0.0
         self._reset_event = threading.Event()  # signal EKF reset to _seg_loop
         self._seg_thread = None  # reference for join on shutdown
+        # One-shot sign sanity log. Fires the first servo step after the
+        # filter has a real measurement and the error is outside the
+        # dead-zone; re-armed on any full reset so each session logs once.
+        self._pbvs_sign_logged = False
+
+        # ── Safety / auto-termination (all None = disabled) ─────────────
+        # Robot-base-frame Z floor in mm. Enforced in _servo_step_pbvs
+        # right before set_position so no commanded pose can drop the
+        # end-effector below table height (or whatever the operator sets).
+        self._z_floor_mm = None
+
+        # Auto-exit thresholds (seconds). When a condition is continuously
+        # true for its threshold, the servo loop sets stop_event and the
+        # process shuts down cleanly. Timers only start *after* the servo
+        # is enabled (robot.enabled True); they reset on disable so an
+        # operator 'v'-toggle doesn't false-trigger exit.
+        self._auto_exit_converge_sec = None
+        self._auto_exit_lost_sec = None
+        self._auto_exit_max_sec = None
+        # Simple depth-based stop (metres). When set, the converge-sec
+        # timer tests ekf_z <= stop_depth_m instead of the camera-frame
+        # PBVS dead-zone. Populated from argparse (--stop-depth-m).
+        # Unlike the dead-zone test, this does not require err_m to
+        # shrink, so it works for IBVS (no err_m) and for EKF runs
+        # where a miscalibrated depth scale drives err_m the wrong way.
+        self._stop_depth_m = None
+        # Timer state populated by _seg_loop / _servo_step_pbvs. All are
+        # wall-clock timestamps (time.time()).
+        self._t_servo_enabled_at = None     # set when servo first enabled
+        self._t_last_err_above_dz = None    # last time err_m >= dead_zone
+        self._t_last_centroid_seen = None   # last time centroid was non-None
+        self._auto_exit_reason = None       # set once, for final log
 
     def _get_frame(self):
         with self._frame_lock:
@@ -823,6 +865,7 @@ class DINOv2CameraStreamer(threading.Thread):
                 self._tracker.reset(keep_anchor=False)
                 self._ekf.reset()
                 self._last_servo_vel_cam = np.zeros(3)
+                self._pbvs_sign_logged = False
                 self._reset_event.clear()
                 logger.info("Tracker + EKF FULL reset")
 
@@ -932,6 +975,18 @@ class DINOv2CameraStreamer(threading.Thread):
                         raw_centroid = res.get("best_centroid")
                         if raw_centroid is not None:
                             self.robot.servo_step(raw_centroid, frame.shape)
+                        # Copy the IBVS controller's latest command into
+                        # the logger's state so servo_d{x,y,z}_mm +
+                        # err_px populate for 'ibvs' rows just like the
+                        # PBVS path does for 'ekf' / 'foundationpose'
+                        # rows. err_m stays 0 for IBVS — it has no
+                        # metric error.
+                        ibvs_cmd = getattr(self.robot,
+                                           "_last_ibvs_cmd",
+                                           (0.0, 0.0, 0.0, 0.0))
+                        dx_i, dy_i, dz_i, err_px_i = ibvs_cmd
+                        self._last_servo_cmd = (dx_i, dy_i, dz_i, 0.0)
+                        self._last_ibvs_err_px = float(err_px_i)
 
                 # ── 6b. Refresh FK at VS_RATE so IBVS trajectories are
                 # logged even though RobotController.servo_step does not
@@ -939,6 +994,12 @@ class DINOv2CameraStreamer(threading.Thread):
                 if iter_start - last_fk_time > VS_RATE:
                     self._refresh_fk()
                     last_fk_time = iter_start
+
+                # ── 6c. Evaluate auto-exit (converge / lost / max-time).
+                # No-op when all thresholds are None. Placed after the
+                # servo step + FK refresh so the timers see the latest
+                # err_m and the latest centroid.
+                self._eval_auto_exit(centroid_present=(centroid is not None))
 
                 # ── 7. Log metrics to CSV ─────────────────────────────
                 iter_ms = (time.time() - iter_start) * 1000.0
@@ -972,6 +1033,12 @@ class DINOv2CameraStreamer(threading.Thread):
                 fp_raw = res.get("fp_position_cam")
                 fp_raw_cols = _fmt_vec(fp_raw)
 
+                # err_px is populated only for IBVS rows; EKF/FP rows
+                # write empty so downstream analysis can key off the
+                # presence of either err_m or err_px.
+                err_px_col = (f"{self._last_ibvs_err_px:.2f}"
+                              if self.pipeline_mode == "ibvs" else "")
+
                 self._csv_writer.writerow([
                     f"{iter_start:.6f}",
                     self._frame_idx,
@@ -990,6 +1057,7 @@ class DINOv2CameraStreamer(threading.Thread):
                     f"{iter_ms:.1f}",
                     rx, ry, rz,
                     *fp_raw_cols,
+                    err_px_col,
                 ])
                 self._csv_file.flush()
 
@@ -1001,17 +1069,114 @@ class DINOv2CameraStreamer(threading.Thread):
         self._csv_file.close()
         logger.info("Metrics saved: %s", self._csv_path)
 
+    def _eval_auto_exit(self, centroid_present: bool):
+        """
+        Evaluate the three auto-exit conditions (converge / lost / max
+        time) and set self.stop_event if any are tripped. No-op when:
+          * all thresholds are None (feature disabled), or
+          * the servo hasn't been enabled yet (no motion is commanded so
+            convergence/loss timers would be meaningless), or
+          * stop_event is already set (another reason won the race).
+        """
+        if self.stop_event.is_set():
+            return
+        # If the user has disabled servo (RobotController.enabled == False),
+        # clear the "servo enabled since" stamp so re-enabling later
+        # restarts the timers from scratch instead of instantly tripping.
+        if self.robot is None or not getattr(self.robot, "enabled", False):
+            self._t_servo_enabled_at = None
+            return
+
+        now = time.time()
+        # Arm timers on the first tick with servo enabled. This also
+        # handles IBVS mode, which never calls _servo_step_pbvs — so
+        # lost-sec and max-sec auto-exits still work there (converge-sec
+        # is a no-op for IBVS unless a robot-frame target is set).
+        if self._t_servo_enabled_at is None:
+            self._t_servo_enabled_at = now
+            self._t_last_err_above_dz = now
+            self._t_last_centroid_seen = now
+
+        if centroid_present:
+            self._t_last_centroid_seen = now
+
+        # Depth-based convergence override. When --stop-depth-m is set
+        # we test ekf.position[2] <= stop_depth_m instead of the
+        # camera-frame PBVS dead-zone. This is the only way to grade
+        # IBVS (which has no err_m) and it also avoids the EKF-depth-
+        # drift failure mode where a miscalibrated monocular scale
+        # keeps err_m above the dead-zone indefinitely even though the
+        # arm is physically near the object. `ekf.position` is always
+        # populated once the filter initialises (which happens on the
+        # first centroid + depth pair), so this works in all three
+        # pipelines uniformly.
+        if self._stop_depth_m is not None:
+            if self._ekf.is_initialised:
+                ekf_z_m = float(self._ekf.position[2])
+                if ekf_z_m > self._stop_depth_m:
+                    self._t_last_err_above_dz = now
+            else:
+                self._t_last_err_above_dz = now
+
+        if (self._auto_exit_max_sec is not None
+                and now - self._t_servo_enabled_at >= self._auto_exit_max_sec):
+            self._auto_exit_reason = (
+                f"max-time timeout ({self._auto_exit_max_sec:.1f}s) reached")
+        elif (self._auto_exit_lost_sec is not None
+              and self._t_last_centroid_seen is not None
+              and now - self._t_last_centroid_seen >= self._auto_exit_lost_sec):
+            dt = now - self._t_last_centroid_seen
+            self._auto_exit_reason = (
+                f"object out of view: no centroid for {dt:.1f}s "
+                f">= {self._auto_exit_lost_sec:.1f}s")
+        elif (self._auto_exit_converge_sec is not None
+              and self._t_last_err_above_dz is not None
+              and now - self._t_last_err_above_dz
+              >= self._auto_exit_converge_sec):
+            dt = now - self._t_last_err_above_dz
+            if self._stop_depth_m is not None:
+                ekf_z_m = (float(self._ekf.position[2])
+                           if self._ekf.is_initialised else float("nan"))
+                self._auto_exit_reason = (
+                    f"converged (depth): ekf_z={ekf_z_m:.3f}m <= "
+                    f"stop_depth={self._stop_depth_m:.3f}m for {dt:.1f}s "
+                    f">= {self._auto_exit_converge_sec:.1f}s")
+            else:
+                self._auto_exit_reason = (
+                    f"converged (camera-frame): err_m < dead_zone "
+                    f"for {dt:.1f}s >= {self._auto_exit_converge_sec:.1f}s")
+
+        if self._auto_exit_reason is not None:
+            logger.info("AUTO-EXIT tripped: %s. Stopping servo loop.",
+                        self._auto_exit_reason)
+            self.stop_event.set()
+
     def _servo_step_pbvs(self, ekf_position: np.ndarray):
         """Position-based servo step using EKF-filtered 3D pose."""
         if self.robot._arm is None or not self.robot.enabled:
             return
 
         now = time.time()
+        # First real servo step per enable: arm the auto-exit timers
+        # (converge, lost, max-sec) from here rather than program start,
+        # so perception-only warmup time doesn't burn the budget.
+        if self._t_servo_enabled_at is None:
+            self._t_servo_enabled_at = now
+            self._t_last_err_above_dz = now
+            self._t_last_centroid_seen = now
+
         if now - self.robot._last_t < VS_RATE:
             return
         self.robot._last_t = now
 
         v_robot, v_cam, err_m = self._pbvs.compute_velocity(ekf_position)
+        # Update convergence timer: the "time since error last exceeded
+        # the dead zone" is what the camera-frame converge auto-exit
+        # tests against. Skipped when --stop-depth-m is in use, since
+        # _eval_auto_exit drives the timer from depth instead.
+        if (self._stop_depth_m is None
+                and err_m >= self._pbvs.dead_zone_m):
+            self._t_last_err_above_dz = now
         if err_m < self._pbvs.dead_zone_m:
             self._last_servo_vel_cam = np.zeros(3)
             self._last_servo_cmd = (0.0, 0.0, 0.0, err_m)
@@ -1024,6 +1189,33 @@ class DINOv2CameraStreamer(threading.Thread):
 
         # Constant approach along robot X (added after PBVS velocity)
         dx_mm += VS_APPROACH
+
+        # One-shot sign sanity log on the first real servo step per session.
+        # Prints the full sign trace (object in cam frame → error → v_cam →
+        # v_robot → dx/dy/dz_mm) so a bad mount/calibration produces an
+        # obvious pattern rather than silent drift. See also
+        # experiments/check_servo_signs.py for an offline version of this
+        # trace run against canonical inputs.
+        if not self._pbvs_sign_logged:
+            ex, ey, ez = float(ekf_position[0] - 0.0), \
+                         float(ekf_position[1] - 0.0), \
+                         float(ekf_position[2] - self._pbvs.target_depth)
+            logger.info(
+                "PBVS sign trace (first step): "
+                "obj_cam=(%.3f,%.3f,%.3f)m  err_cam=(%+.3f,%+.3f,%+.3f)m  "
+                "v_cam=(%+.3f,%+.3f,%+.3f)m/s  v_robot=(%+.3f,%+.3f,%+.3f)m/s  "
+                "delta_mm=(%+.1f,%+.1f,%+.1f) (incl. approach=%+.1f)",
+                ekf_position[0], ekf_position[1], ekf_position[2],
+                ex, ey, ez,
+                v_cam[0], v_cam[1], v_cam[2],
+                v_robot[0], v_robot[1], v_robot[2],
+                dx_mm, dy_mm, dz_mm, VS_APPROACH)
+            logger.info(
+                "  Expected signs (zed_forward mount): "
+                "obj-left  (err_x<0) -> dy_mm>0  |  "
+                "obj-above (err_y<0) -> dz_mm>0  |  "
+                "obj-far   (err_z>0) -> dx_mm>0")
+            self._pbvs_sign_logged = True
 
         # Store camera-frame velocity for EKF egomotion compensation.
         # The EKF predict step expects velocity in camera coords, so we
@@ -1041,9 +1233,27 @@ class DINOv2CameraStreamer(threading.Thread):
                 if pos is None:
                     return
                 self._last_robot_pos = pos
+
+                # Z floor safety clamp: never command the end-effector
+                # below self._z_floor_mm. If the controller would, absorb
+                # the illegal delta into dz_mm so the CSV log reflects
+                # what was actually sent to the arm.
+                tgt_z = pos[2] + dz_mm
+                if self._z_floor_mm is not None and tgt_z < self._z_floor_mm:
+                    clamped = self._z_floor_mm
+                    if not getattr(self, "_z_floor_warned", False):
+                        logger.warning(
+                            "Z floor engaged: clamped commanded z "
+                            "%.1f -> %.1f mm (floor=%.1f).",
+                            tgt_z, clamped, self._z_floor_mm)
+                        self._z_floor_warned = True
+                    dz_mm = clamped - pos[2]
+                    tgt_z = clamped
+                    self._last_servo_cmd = (dx_mm, dy_mm, dz_mm, err_m)
+
                 self.robot._arm.set_position(
                     x=pos[0] + dx_mm, y=pos[1] + dy_mm,
-                    z=pos[2] + dz_mm,
+                    z=tgt_z,
                     roll=pos[3], pitch=pos[4], yaw=pos[5],
                     speed=VS_SPEED, mvacc=VS_MVACC, wait=True)
                 logger.info(
@@ -1102,7 +1312,7 @@ class DINOv2CameraStreamer(threading.Thread):
                 "Failed to read ZED intrinsics, keeping defaults: %s", e)
 
         ts = time.strftime("%Y%m%d_%H%M%S")
-        anno_path = os.path.abspath(f"vs_dinov2_{ts}.mp4")
+        anno_path = os.path.abspath(f"vs_dinov2_{self._out_prefix_str}{ts}.mp4")
         video_writer = None
 
         mat = sl.Mat()
@@ -1221,7 +1431,7 @@ class DINOv2CameraStreamer(threading.Thread):
 
                 if video_writer is None:
                     rh, rw = rendered_write.shape[:2]
-                    video_path = os.path.abspath(f"vs_dinov2_{ts}.mp4")
+                    video_path = os.path.abspath(f"vs_dinov2_{self._out_prefix_str}{ts}.mp4")
                     video_writer = cv2.VideoWriter(
                         video_path, cv2.VideoWriter_fourcc(*"mp4v"),
                         30.0, (rw, rh))
@@ -1389,6 +1599,9 @@ if __name__ == "__main__":
     parser.add_argument("--run-tag", type=str, default="",
                         help="Free-form tag written to every CSV row "
                              "(e.g. 'cheezit_pose1_trial2').")
+    parser.add_argument("--out-prefix", type=str, default="",
+                        help="Prefix for output filenames (CSV and video). "
+                             "E.g. 'cheez_it_box_ekf'.")
     # FoundationPose-specific flags (ignored unless --mode foundationpose)
     parser.add_argument("--fp-mesh", type=str, default=None,
                         help="Path to OBJ/PLY CAD mesh (metres). Required "
@@ -1442,6 +1655,41 @@ if __name__ == "__main__":
                         help="PBVS 3D position dead zone in metres "
                              "(default matches the previously hardcoded "
                              "value).")
+    # Safety / auto-termination knobs (default: disabled, preserves behavior)
+    parser.add_argument("--z-floor-mm", type=float, default=None,
+                        help="Robot-base-frame Z floor in mm. Every PBVS "
+                             "set_position command clamps its z so the "
+                             "end-effector never goes below this height. "
+                             "Disabled by default.")
+    parser.add_argument("--auto-exit-converge-sec", type=float, default=None,
+                        help="If the PBVS 3D error stays inside the "
+                             "dead-zone continuously for this many "
+                             "seconds, the servo loop shuts itself down "
+                             "cleanly and the process exits. Disabled by "
+                             "default (use 'q' key instead).")
+    parser.add_argument("--auto-exit-lost-sec", type=float, default=None,
+                        help="If no centroid is produced by perception "
+                             "for this many consecutive seconds (object "
+                             "out of view / mask lost), the servo loop "
+                             "shuts itself down. Disabled by default.")
+    parser.add_argument("--auto-exit-max-sec", type=float, default=None,
+                        help="Wall-clock timeout from servo-enable to "
+                             "auto-shutdown. Safety net so a non-converging "
+                             "trial cannot run forever in a batch. "
+                             "Disabled by default.")
+    parser.add_argument("--stop-depth-m", type=float, default=None,
+                        help="Simple depth-based stop. When the "
+                             "EKF-filtered camera-frame Z (object "
+                             "depth, metres) stays <= this value "
+                             "continuously for --auto-exit-converge-sec "
+                             "seconds, the servo loop shuts itself "
+                             "down cleanly. This replaces the default "
+                             "camera-frame PBVS dead-zone test when "
+                             "set, which is important for IBVS (no "
+                             "err_m at all) and for EKF runs where a "
+                             "bad depth scale prevents err_m from ever "
+                             "reaching the dead-zone. Disabled by "
+                             "default.")
     args = parser.parse_args()
 
     # Apply CLI overrides
@@ -1541,6 +1789,22 @@ if __name__ == "__main__":
     cam_thread.pipeline_mode = args.mode
     cam_thread.run_tag = args.run_tag
     cam_thread.reference_path = args.reference
+    cam_thread._z_floor_mm = args.z_floor_mm
+    cam_thread._auto_exit_converge_sec = args.auto_exit_converge_sec
+    cam_thread._auto_exit_lost_sec = args.auto_exit_lost_sec
+    cam_thread._auto_exit_max_sec = args.auto_exit_max_sec
+    cam_thread._stop_depth_m = args.stop_depth_m
+    if any(x is not None for x in (args.z_floor_mm,
+                                   args.auto_exit_converge_sec,
+                                   args.auto_exit_lost_sec,
+                                   args.auto_exit_max_sec,
+                                   args.stop_depth_m)):
+        logger.info(
+            "Safety/auto-exit: z_floor_mm=%s  converge_sec=%s  "
+            "lost_sec=%s  max_sec=%s  stop_depth_m=%s",
+            args.z_floor_mm, args.auto_exit_converge_sec,
+            args.auto_exit_lost_sec, args.auto_exit_max_sec,
+            args.stop_depth_m)
 
     if args.mode == "foundationpose":
         if args.fp_mesh is None and args.fp_box is None:

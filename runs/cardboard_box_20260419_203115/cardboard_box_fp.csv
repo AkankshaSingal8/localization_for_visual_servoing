@@ -1,0 +1,1 @@
+timestamp,frame,dt_ms,mode,pipeline,run_tag,centroid_u,centroid_v,ekf_x,ekf_y,ekf_z,ekf_vx,ekf_vy,ekf_vz,ekf_uncertainty,depth_metric,servo_dx_mm,servo_dy_mm,servo_dz_mm,err_m,iter_time_ms,robot_x_mm,robot_y_mm,robot_z_mm,fp_raw_x,fp_raw_y,fp_raw_z

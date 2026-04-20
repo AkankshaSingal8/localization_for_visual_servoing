@@ -354,10 +354,16 @@ class PBVSController:
     a desired position in the camera frame (typically on the optical
     axis at a target depth).
 
-    v_cmd = -lambda * (t_obj - t_desired)
+    For an eye-in-hand rig staring at a world-static object, the
+    object's apparent camera-frame velocity is d/dt(c_o) = -v_cam, so
+    the standard P control law d/dt(c_o) = -lambda*(c_o - t_desired)
+    yields
 
-    The robot-to-camera transform (R_cam, t_cam) maps camera-frame
-    velocities to robot base-frame velocities.
+        v_cam = +lambda * (t_obj - t_desired)
+
+    i.e. the commanded camera velocity is *in the direction of* the
+    error. The R_cam_to_robot rotation then maps that velocity into
+    robot base-frame axes.
     """
 
     def __init__(self,
@@ -421,8 +427,15 @@ class PBVSController:
         if err_norm < self.dead_zone_m:
             return np.zeros(3), np.zeros(3), err_norm
 
-        # PBVS control law: camera-frame velocity
-        v_cam = -self.gain * error
+        # PBVS control law (eye-in-hand, world-static target).
+        # A world-static object's apparent camera-frame velocity is
+        # d/dt(c_o) = -v_cam, so driving d/dt(c_o) = -lambda*(c_o-desired)
+        # requires v_cam = +lambda*error. The commanded camera velocity
+        # therefore points *in the same direction* as the positional
+        # error: if the object is to the left (error_x < 0), move the
+        # camera to the left; if the object is too far (error_z > 0),
+        # move the camera forward.
+        v_cam = self.gain * error
 
         # Clamp per-axis
         v_cam = np.clip(v_cam, -self.max_vel, self.max_vel)

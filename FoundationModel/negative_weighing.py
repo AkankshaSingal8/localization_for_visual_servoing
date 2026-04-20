@@ -789,6 +789,12 @@ class RobotController:
         self.cal_status       = "uncalibrated"
         self._last_centroid   = None
         self._last_centroid_t = 0.0
+        # Last IBVS command dispatched, for per-frame CSV logging in
+        # dinov2_servo.py's _seg_loop. Tuple of (dx_mm, dy_mm, dz_mm,
+        # err_px). err is pixel magnitude (IBVS has no metric error);
+        # the CSV's err_m column therefore reads 0 for ibvs rows and
+        # the pixel error is available separately in err_px.
+        self._last_ibvs_cmd = (0.0, 0.0, 0.0, 0.0)
 
     def _get_pos(self):
         ret = self._arm.get_position()
@@ -959,6 +965,11 @@ class RobotController:
         else:
             dy_mm = 0.0
             dz_mm = 0.0
+
+        # Publish the command so the per-frame CSV logger can pick it
+        # up. Done BEFORE the set_position call so the log reflects what
+        # the controller *tried* to send even if set_position fails.
+        self._last_ibvs_cmd = (dx_mm, dy_mm, dz_mm, err_r)
 
         with self._lock:
             try:

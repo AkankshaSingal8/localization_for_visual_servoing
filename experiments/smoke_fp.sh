@@ -88,6 +88,17 @@
 #                               preflight ping.
 #   SKIP_ARM_PRECHECK=1         Skip the ICMP ping to the xArm (xarm
 #                               SDK import is still checked).
+#   CAM_TO_ROBOT=zed_forward    Camera-to-robot rotation preset (see
+#                               CAM_ROT_PRESETS in
+#                               FoundationModel/dinov2_servo.py).
+#                               Default is 'zed_forward' for the ZED
+#                               Mini eye-in-hand mount on the xArm;
+#                               change to 'identity' only if the
+#                               camera axes are physically aligned
+#                               with the robot base. Wrong preset =
+#                               robot moves along a wrong axis
+#                               (classic symptom: arm goes UP instead
+#                               of FORWARD when the object is too far).
 
 set -euo pipefail
 
@@ -95,8 +106,14 @@ source "$(dirname "$0")/_env.sh"
 
 ARM_IP="${ARM_IP:-192.168.1.241}"
 SMOKE="${SMOKE:-0}"
-REFERENCE="${REFERENCE:-experiments/input_image_transparent.png}"
 FP_BOX="${FP_BOX:-0.19 0.06 0.22}"
+
+if [[ $# -ge 1 ]]; then
+    REFERENCE="$1"
+fi
+REFERENCE="${REFERENCE:-experiments/input_image_transparent.png}"
+OBJ_NAME="$(basename "${REFERENCE%.*}")"
+OUT_PREFIX="${OBJ_NAME}_foundationpose"
 
 # ── Reference ↔ FP_BOX sanity check ───────────────────────────────────
 # Cheap heuristic: if REFERENCE obviously isn't the Cheez-It file but
@@ -194,12 +211,17 @@ if [ "${#FP_BOX_ARR[@]}" -ne 3 ]; then
     exit 1
 fi
 
+CAM_TO_ROBOT="${CAM_TO_ROBOT:-zed_forward}"
+
 PY_ARGS=(
     FoundationModel/dinov2_servo.py
     --reference "$REFERENCE"
+    --out-prefix "$OUT_PREFIX"
     --mode foundationpose
     --fp-box "${FP_BOX_ARR[@]}"
+    --cam-to-robot "$CAM_TO_ROBOT"
 )
+echo "[env] CAM_TO_ROBOT=$CAM_TO_ROBOT (physical ZED-Mini eye-in-hand default)."
 
 if [ "$SMOKE" = "1" ]; then
     PY_ARGS+=( --no-robot )
@@ -248,7 +270,8 @@ if [ -n "${DEPTH_CAL_M:-}" ]; then
     PY_ARGS+=( --depth-cal-m "$DEPTH_CAL_M" )
 fi
 
-echo "[config] REFERENCE = $REFERENCE"
-echo "[config] FP_BOX    = ${FP_BOX_ARR[*]}"
+echo "[config] REFERENCE  = $REFERENCE"
+echo "[config] OUT_PREFIX = $OUT_PREFIX"
+echo "[config] FP_BOX     = ${FP_BOX_ARR[*]}"
 echo "[launch] python ${PY_ARGS[*]}"
 exec python "${PY_ARGS[@]}"

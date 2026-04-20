@@ -79,6 +79,17 @@
 #                          the arm is reachable through a gateway that
 #                          blocks ICMP; xarm SDK import is still
 #                          checked.
+#   CAM_TO_ROBOT=zed_forward
+#                          Camera-to-robot rotation preset (see
+#                          CAM_ROT_PRESETS in FoundationModel/dinov2_servo.py).
+#                          Default is 'zed_forward' for the ZED Mini
+#                          eye-in-hand mount on the xArm; change to
+#                          'identity' only if the camera axes are
+#                          physically aligned with the robot base.
+#                          Wrong preset = robot moves along a wrong
+#                          axis (classic symptom: arm goes UP instead
+#                          of FORWARD when the object is too far,
+#                          because camera +Z is mapped to robot +Z).
 #
 # Reference image note
 # --------------------
@@ -94,6 +105,13 @@ source "$(dirname "$0")/_env.sh"
 
 ARM_IP="${ARM_IP:-192.168.1.241}"
 SMOKE="${SMOKE:-0}"
+
+if [[ $# -ge 1 ]]; then
+    REFERENCE="$1"
+fi
+REFERENCE="${REFERENCE:-experiments/input_image_transparent.png}"
+OBJ_NAME="$(basename "${REFERENCE%.*}")"
+OUT_PREFIX="${OBJ_NAME}_ekf"
 
 # ── Preflight ──────────────────────────────────────────────────────────
 if [ "$SMOKE" = "1" ]; then
@@ -147,11 +165,16 @@ EOF
 fi
 
 # ── Build the Python invocation ────────────────────────────────────────
+CAM_TO_ROBOT="${CAM_TO_ROBOT:-zed_forward}"
+
 PY_ARGS=(
     FoundationModel/dinov2_servo.py
-    --reference experiments/input_image_transparent.png
+    --reference "$REFERENCE"
+    --out-prefix "$OUT_PREFIX"
     --mode ekf
+    --cam-to-robot "$CAM_TO_ROBOT"
 )
+echo "[env] CAM_TO_ROBOT=$CAM_TO_ROBOT (physical ZED-Mini eye-in-hand default)."
 
 if [ "$SMOKE" = "1" ]; then
     PY_ARGS+=( --no-robot )
@@ -200,5 +223,7 @@ if [ -n "${DEPTH_CAL_M:-}" ]; then
     PY_ARGS+=( --depth-cal-m "$DEPTH_CAL_M" )
 fi
 
+echo "[config] REFERENCE  = $REFERENCE"
+echo "[config] OUT_PREFIX = $OUT_PREFIX"
 echo "[launch] python ${PY_ARGS[*]}"
 exec python "${PY_ARGS[@]}"
