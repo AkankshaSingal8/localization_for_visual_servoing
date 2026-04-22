@@ -1,2 +1,0 @@
-timestamp,frame,dt_ms,mode,pipeline,run_tag,centroid_u,centroid_v,ekf_x,ekf_y,ekf_z,ekf_vx,ekf_vy,ekf_vz,ekf_uncertainty,depth_metric,servo_dx_mm,servo_dy_mm,servo_dz_mm,err_m,iter_time_ms,robot_x_mm,robot_y_mm,robot_z_mm,fp_raw_x,fp_raw_y,fp_raw_z
-1776647250.748726,1,100.6,detect,ibvs,cardboard_box_pbvs,629,469,-0.008765,0.086856,0.557788,0.000000,0.000000,0.000000,0.4472135954999579,0.5577877233440198,0.00,0.00,0.00,0.000000,2071.1,205.26,5.56,-52.85,,,

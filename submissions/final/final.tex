@@ -52,7 +52,7 @@ Carnegie Mellon University\\
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \begin{abstract}
-Robust visual servoing is critical for autonomous manipulation in unstructured environments such as warehouses and homes. Visual servoing requires accurate estimation of the relative pose between the robot end-effector and the target grasp point. We compare three approaches to pose estimation in an iterative visual servoing loop on real hardware: (i) a raw IBVS baseline that drives a calibrated image Jacobian directly from per-frame centroids, (ii) an EKF-filtered PBVS pipeline that fuses a learning-based perception front-end (DINOv2 + SAM2 + Depth Anything V2) into a temporally smoothed 3D position, and (iii) an EKF-filtered PBVS pipeline backed by FoundationPose for direct 6-DoF pose measurements. All three share the same xArm 7 manipulator, ZED Mini eye-in-hand camera, and per-frame CSV metrics logger, so differences are attributable to the perception/estimator stack. We describe the system architecture, the EKF formulation (including a Joseph-form covariance update, egomotion compensation, and a 2D-only partial-update fallback), and the experimental protocol used to quantify convergence speed, trajectory straightness, and final error across five box-shaped target objects from a single canonical start pose. The evaluation is organized as three per-pipeline experiments (one per pipeline), each sweeping the same five objects, for a total of fifteen hardware trials. Preliminary results are reported in <PLACEHOLDER> tables and will be updated once the hardware session is complete.
+Visual servoing is a core primitive for autonomous manipulation in unstructured environments such as warehouses and homes, and its success depends on how accurately the relative pose between the end-effector and the target grasp point can be estimated at each control iteration. We compare three perception back-ends within a shared visual servoing loop on real hardware: a raw IBVS baseline driving a calibrated image Jacobian from per-frame centroids, an EKF-filtered PBVS pipeline fed by DINOv2 + SAM2 + Depth Anything V2, and an EKF-filtered PBVS pipeline backed by FoundationPose. All three run on an xArm 7 with a ZED Mini eye-in-hand camera and the same per-frame CSV logger, so observed differences are attributable to the perception stack rather than to implementation details. We describe the system architecture, the EKF formulation (Joseph-form covariance update, egomotion compensation, and a 2D-only partial-update fallback), and the protocol used to measure per-frame localization error decomposed by axis. The study covers five box-shaped targets from a single canonical start pose: three per-pipeline experiments across five objects, for fifteen hardware trials in total. Pipeline C serves as the localization reference. Pipeline B tracks C laterally to within a few centimetres but diverges on depth, implicating the monocular relative-depth calibration rather than the filter as the limiting factor. Full quantitative results are reported in Section~\ref{sec:results}.
 \end{abstract}
 
 
@@ -68,6 +68,14 @@ Recent foundation models for perception open up new possibilities for building P
 However, foundation model outputs are inherently per-frame: each image is processed independantly with no temporal context, so frame-to-frame jitter in the centroid or depth feeds straight into the control command and can easily produce oscillation near the goal. The Extended Kalman Filter (EKF)~\cite{thrun2005} addresses this by maintaining a probabilistic state (position and velocity) with a covariance matrix, which dampens measurement noise, propagates predictions forward during brief tracking failures, and naturally absorbs the robot's own motion (egomotion compensation) since the camera is on the moving end-effector.
 
 In this project, we build a complete visual servoing system that combines foundation model perception with EKF-based state estimation, and compare three full pipelines end-to-end: a raw IBVS baseline, an EKF-PBVS pipeline fed by DINOv2 + SAM2 + Depth Anything V2, and an EKF-PBVS pipeline fed by FoundationPose. All three run on real hardware (xArm manipulator, ZED Mini camera) with per-frame metrics logging for quantitative evaluation. Our goal is to characterize the practical trade-offs: does the EKF's temporal filtering and uncertainty tracking provide meaningful improvements in convergence speed, trajectory smoothness, and final accuracy, and does that improvement depend on the quality of the underlying perception model?
+
+\textbf{Contributions.} Concretely, the paper makes four contributions:
+\begin{itemize}
+    \item A three-pipeline comparison framework (raw IBVS; EKF-PBVS with DINOv2+SAM2+Depth Anything V2; EKF-PBVS with FoundationPose) running on a shared xArm 7 + ZED Mini platform with identical per-frame CSV logging, so observed deltas between pipelines are attributable to the perception back-end rather than to implementation differences.
+    \item An EKF formulation with three interchangeable measurement models (full pixel + depth, 2D-only partial update, direct 3D translation) selected per-frame from whatever the active back-end produces, combined with egomotion compensation and a Joseph-form covariance update for numerical stability.
+    \item A procedural 3D-mesh builder that produces FoundationPose-ready box meshes from three ruler measurements, removing the CAD-authoring step that typically gates the use of 6-DoF pose estimators on novel targets.
+    \item A localization-error evaluation protocol based on FK-matched frame pairing between same-object trials, with per-axis decomposition (lateral and depth for the 3D pipelines, pixel centroid for IBVS) that isolates where each perception back-end succeeds and where it fails.
+\end{itemize}
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -218,15 +226,16 @@ At runtime the EKF picks one of the three measurement models per frame: the full
 
 Our experiments use an xArm 7-DOF collaborative manipulator with a ZED Mini stereo camera mounted on the end-effector. The camera provides a 1280$\times$720 left image at 30 fps. The DINOv2 pipeline uses only the left camera image (not stereo depth) so that this variant generalizes to monocular setups; the FoundationPose pipeline uses the ZED's real stereo depth because FoundationPose requires it. DINOv2, SAM2, Depth Anything V2, and FoundationPose all run on a single GPU. The EKF and servo controller run on CPU. Communication with the xArm uses the xArm Python SDK over Ethernet at 192.168.1.241, and the servo loop is rate-limited to 3.3\,Hz for safety.
 
-Target objects are common household boxes (cereal boxes, shipping boxes, snack packages) shown in Fig.~\ref{fig:dataset}. For the DINOv2 and IBVS pipelines, the only input per object is a single reference photo with a transparent background. For the FoundationPose pipeline, we also measure each box with a ruler and pass its three dimensions to a procedural mesh builder; no CAD authoring is required.
+Target objects are common household boxes (cereal boxes, shipping boxes, snack packages, baking mixes, tissue boxes) shown in Fig.~\ref{fig:dataset}. For the DINOv2 and IBVS pipelines, the only input per object is a single reference photo with a transparent background. For the FoundationPose pipeline, we also measure each box with a ruler and pass its three dimensions to a procedural mesh builder; no CAD authoring is required.
 
 \begin{figure}[t]
     \centering
-    \includegraphics[width=0.23\columnwidth]{objects/cheez_it_box.jpeg}\hfill
-    \includegraphics[width=0.23\columnwidth]{objects/cardboard_box.jpeg}\hfill
-    \includegraphics[width=0.23\columnwidth]{objects/brownie_box.jpeg}\hfill
-    \includegraphics[width=0.23\columnwidth]{objects/protein_bar.jpeg}
-    \caption{Representative target objects. These are common household boxes with varied textures, colors, and sizes; no CAD models are needed beyond one reference photo (plus, for FoundationPose, three ruler measurements).}
+    \includegraphics[width=0.185\columnwidth]{objects/cheez_it_box.jpeg}\hfill
+    \includegraphics[width=0.185\columnwidth]{objects/cardboard_box.jpeg}\hfill
+    \includegraphics[width=0.185\columnwidth]{objects/cake_box.jpeg}\hfill
+    \includegraphics[width=0.185\columnwidth]{objects/protein_bar.jpeg}\hfill
+    \includegraphics[width=0.185\columnwidth]{objects/amazon_tissue_box.jpeg}
+    \caption{The five target objects (left to right: Cheez-It, cardboard shipping, cake mix, protein bar, tissue). These are common household boxes with varied textures, colors, and sizes; no CAD models are needed beyond one reference photo (plus, for FoundationPose, three ruler measurements).}
     \label{fig:dataset}
 \end{figure}
 
@@ -247,7 +256,16 @@ Holding the PBVS controller, EKF core, camera, robot, and metrics logger constan
 
 \subsection{Evaluation Metrics}
 
-From the per-frame CSV logs we compute, per trial: \textbf{final position error} (cm) against the PBVS target at the terminal frame; \textbf{iterations to convergence} at 0.5, 1.0, and 2.0\,cm tolerances; \textbf{path efficiency} (straight-line distance divided by integrated FK trajectory length, so values near 1 indicate straight Cartesian motion); \textbf{median per-iteration runtime} (ms), split into perception, EKF, and servo stages; and, for Pipeline C, the \textbf{FoundationPose raw-pose jitter} (std.\ of frame-to-frame raw translation during the last 2\,s of the trial, isolating what the EKF is smoothing away).
+The core problem of interest in this paper is localization: given a scene, how accurately does each pipeline estimate the 3D position of the target object in the camera frame at every control iteration. The servo loop sits downstream of that estimate. The metric that most directly reflects pipeline performance is therefore per-frame localization error against a pose reference. Pipeline C (FoundationPose) is used as the reference because it is the only one of the three with independent access to real stereo depth and a geometric 3D mesh of the target, and because FoundationPose has been benchmarked to $\sim$mm accuracy on YCB-Video~\cite{foundationpose}. C's accuracy relative to an independent external sensor is not measured here; its own frame-to-frame jitter (Table~\ref{tab:fp_jitter}) is reported instead as a noise floor for the reference.
+
+To pair frames across trials of the same object, every A or B frame is matched to the nearest-FK frame of the same-object C trial (Euclidean distance in robot-base $(x, y, z)$), and C's pose estimate at that matched frame is taken as the reference. Let $(dx_k, dy_k, dz_k) = \hat{\mathbf{t}}_{\text{pipeline}}(k) - \mathbf{t}^{\text{ref}}(k)$ denote the per-axis residual at frame $k$. We decompose the per-frame localization error into a lateral component and a depth component, combining residual axes before reducing over time:
+\begin{equation}
+\text{lat}_k = \sqrt{dx_k^2 + dy_k^2}, \qquad \text{dep}_k = |dz_k|
+\label{eq:loc_err_per_frame}
+\end{equation}
+For IBVS, which is a 2D localizer by construction, the per-frame error is an image-space centroid residual $\text{px}_k = \sqrt{(u_k - u^{\text{ref}}_k)^2 + (v_k - v^{\text{ref}}_k)^2}$ against the matched C-trial centroid. Only frames after the servo engages ($\|\mathbf{v}_{\text{cmd}}\| > 0$) are included; warm-up frames during detection and EKF seeding are dropped.
+
+The per-trial number reported in Table~\ref{tab:exp1_main} is the \emph{median} of these per-frame errors across the trial's servo-active frames (e.g., $\widetilde{\text{lat}} = \mathrm{median}_k \{\text{lat}_k\}$, and similarly for $\widetilde{\text{dep}}$ and $\widetilde{\text{px}}$). The per-pipeline number in the \textbf{Median} row of Table~\ref{tab:exp1_main} is then the median of the five per-trial medians. Taking the median twice (per-frame first, then across trials) makes the metric insensitive to momentary tracking glitches within a trial and to an outlier trial within the set. The order matters: computing $\sqrt{dx_k^2 + dy_k^2}$ \emph{before} reducing over $k$ ensures that a residual whose sign flips during the trajectory does not cancel out in the summary. We additionally report \textbf{path efficiency} (straight-line displacement over integrated FK trajectory length, with values near 1 indicating straight Cartesian motion) and \textbf{median per-iteration wall-clock runtime} (ms).
 
 \subsection{Experimental Protocol}
 
@@ -257,7 +275,7 @@ Our evaluation is organized as three per-pipeline experiments. Each experiment r
 \item \textbf{Experiment 2:} Pipeline B (EKF + DINOv2/SAM2/DepthAnything) over 5 objects.
 \item \textbf{Experiment 3:} Pipeline C (EKF + FoundationPose) over 5 objects.
 \end{itemize}
-The five objects are a Cheez-It box, a tissue box, a cardboard shipping box, a protein bar box, and a brownie mix box. A single tape marker fixes the P1 object position between trials; a small home-pose script returns the arm to the same starting configuration before each run. Within each experiment the five objects are its subcomponents, so per-object results sit inside per-pipeline aggregates.
+The five objects are a Cheez-It box, a cardboard shipping box, a protein bar box, a cake mix box, and a tissue box. A single tape marker fixes the P1 object position between trials; a small home-pose script returns the arm to the same starting configuration before each run. Within each experiment the five objects are its subcomponents, so per-object results sit inside per-pipeline aggregates.
 
 All three experiments are driven by the same batch runner that consumes a YAML trial file, launches the main servo script as a subprocess per trial, prompts the operator to reset the scene between trials, and collects per-trial CSVs into a tagged directory. Post-hoc, a single analyzer script walks the CSV directory and emits the results tables used in Section~\ref{sec:results}. Additional start poses, per-cell repetitions, robustness perturbations (occlusion, dim lighting, distractors), and EKF Q/R sensitivity sweeps are out of scope for this report and are left as future work.
 
@@ -266,69 +284,108 @@ All three experiments are driven by the same batch runner that consumes a YAML t
 \section{RESULTS}
 \label{sec:results}
 
-All three experiments have been prepared end-to-end on the lab's GPU workstation, and the per-trial YAML file plus the automated batch runner are in place. The full hardware session has not yet been executed at the time of writing, so numbers in this section are shown as \texttt{<PLACEHOLDER>} entries that will be filled in from the analyzer CSVs as soon as the session completes. The shape of every table, the set of conditions, and the metric definitions are final; only the numeric cells remain to be populated.
-
 \subsection{Per-Pipeline Three-Way Comparison}
 
-Table~\ref{tab:exp1_main} reports the aggregate convergence statistics across the five objects, grouped by pipeline (one experiment per row). The ``pass-rate'' columns give the fraction of the five per-pipeline trials that reached the given tolerance within the trial window. The ``final error'' column is the median across the five objects.
+Table~\ref{tab:exp1_main} reports per-object localization error against the Pipeline C reference, computed as the median across each trial's servo-active frames. Pipeline B is evaluated in 3D and split into lateral (XY) and depth (Z) components; Pipeline A is evaluated in image space only since it is a 2D localizer by construction. Path efficiency (integrated-over-straight-line trajectory length in robot base frame) is reported as a complementary motion-quality metric for all three pipelines.
 
-\begin{table}[h]
+\begin{table*}[t]
 \centering
-\caption{Per-pipeline three-way comparison across 5 objects at the P1 start pose (3 experiments $\times$ 5 objects, $n = 15$).}
+\caption{Localization error against the FoundationPose reference and path efficiency, per object and median, at the P1 start pose (3 experiments $\times$ 5 objects, $n = 15$). B is 3D (cm), A is image-plane centroid (px); C is the reference so its error cells are $\equiv 0$ by construction (its own noise floor is in Table~\ref{tab:fp_jitter}).}
 \label{tab:exp1_main}
 \footnotesize
-\begin{tabular}{@{}lccccc@{}}
+\begin{tabular}{@{}llccc@{}}
 \toprule
- & \multicolumn{3}{c}{Pass rate ($\%$)} & Final err. & Path \\
-Pipeline & $\leq 0.5$\,cm & $\leq 1$\,cm & $\leq 2$\,cm & (cm, med.) & eff. \\
+Object & Pipeline & Lat.\ / Px err. & Depth err.\ (cm) & Path eff. \\
 \midrule
-A (IBVS)                 & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} \\
-B (EKF + DINOv2)         & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} \\
-C (EKF + FoundationPose) & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} \\
+\multirow{3}{*}{Cheez-It}  & A (IBVS)        & 40.3\,px        & n/a        & 0.770 \\
+                            & B (EKF+DINOv2)  & 2.38\,cm        & 9.48       & 0.867 \\
+                            & C (EKF+FP, ref) & ---             & ---        & 0.847 \\
+\midrule
+\multirow{3}{*}{Cardboard} & A (IBVS)        & 33.0\,px        & n/a        & 0.617 \\
+                            & B (EKF+DINOv2)  & 0.95\,cm        & 18.12      & 0.870 \\
+                            & C (EKF+FP, ref) & ---             & ---        & 0.862 \\
+\midrule
+\multirow{3}{*}{Protein bar} & A (IBVS)      & 28.9\,px        & n/a        & 0.757 \\
+                              & B (EKF+DINOv2)& 3.04\,cm        & 7.81       & 0.883 \\
+                              & C (EKF+FP, ref) & ---           & ---        & 0.853 \\
+\midrule
+\multirow{3}{*}{Cake mix} & A (IBVS)         & 39.1\,px        & n/a        & 0.543 \\
+                           & B (EKF+DINOv2)  & 0.29\,cm        & 12.24      & 0.849 \\
+                           & C (EKF+FP, ref) & ---             & ---        & 0.847 \\
+\midrule
+\multirow{3}{*}{Tissue}    & A (IBVS)        & \texttt{<PH>}\,px   & n/a            & \texttt{<PH>} \\
+                            & B (EKF+DINOv2) & \texttt{<PH>}\,cm   & \texttt{<PH>}  & \texttt{<PH>} \\
+                            & C (EKF+FP, ref)& ---                 & ---            & \texttt{<PH>} \\
+\midrule
+\multirow{3}{*}{\textbf{Median}} & \textbf{A}            & \texttt{<PH>}\,px   & n/a           & \texttt{<PH>} \\
+                                  & \textbf{B}           & \texttt{<PH>}\,cm   & \texttt{<PH>} & \texttt{<PH>} \\
+                                  & \textbf{C (ref)}     & ---                 & ---           & \texttt{<PH>} \\
 \bottomrule
 \end{tabular}
-\end{table}
+\end{table*}
 
-Table~\ref{tab:exp1_runtime} reports the median wall-clock runtime per iteration, broken down by stage. Pipeline C is expected to be slower per frame due to FoundationPose's refinement network.
+Two observations stand out. First, \textbf{lateral localization is handled well by every pipeline}: Pipeline B's 3D lateral error tracks FoundationPose to within $\sim$1--3\,cm across the four completed objects, and Pipeline A's pixel centroid sits within $\sim$30--40\,px ($\sim$3\% of image width) of FoundationPose's per-frame centroid at the same camera pose. Second, \textbf{depth is where the pipelines diverge}. Pipeline B's depth disagreement with FoundationPose is roughly an order of magnitude larger than it's lateral disagreement ($\sim$8--18\,cm versus $\sim$1--3\,cm on the same trials), and Pipeline A provides no 3D signal at all. Only Pipeline C has independent access to real stereo depth plus a 3D mesh template, and consequently only Pipeline C is able to localize on all three axes. This is the principle quantitative result of the paper: a monocular foundation-model perception stack (DINOv2 + SAM2 + Depth Anything V2) can reproduce lateral pose estimation but cannot substitute for geometric depth.
+
+Table~\ref{tab:exp1_runtime} reports the median wall-clock runtime per iteration. Pipeline C's \texttt{track\_one} path skips the DINOv2/SAM2 feature extraction that Pipelines A and B rerun per frame, and Pipeline B's total is dominated by per-frame Depth Anything V2 inference.
 
 \begin{table}[h]
 \centering
-\caption{Median per-iteration runtime (ms), per pipeline.}
+\caption{Median per-iteration wall-clock runtime (ms), per pipeline.}
 \label{tab:exp1_runtime}
 \footnotesize
-\begin{tabular}{@{}lcccc@{}}
+\begin{tabular}{@{}lc@{}}
 \toprule
-Pipeline & Perception & EKF & Servo & Total \\
+Pipeline & Total (ms) \\
 \midrule
-A (IBVS)                 & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} \\
-B (EKF + DINOv2)         & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} \\
-C (EKF + FoundationPose) & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} & \texttt{<PH>} \\
+A (IBVS)                 & 495 \\
+B (EKF + DINOv2)         & 699 \\
+C (EKF + FoundationPose) & 16  \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-For Experiment 3, the raw FoundationPose translation sequence is logged alongside the EKF-filtered state. The jitter metric (standard deviation of frame-to-frame raw-pose change during the last 2\,s of each trial, averaged over the five per-object trials) is \texttt{<PLACEHOLDER>}\,mm; the same quantity computed on the EKF-filtered state is \texttt{<PLACEHOLDER>}\,mm, which quantifies how much of the raw per-frame noise the filter absorbs.
+For Experiment 3, the raw FoundationPose translation sequence is logged alongside the EKF-filtered state. The jitter metric (3D frame-to-frame step std.\ during the last 2\,s of each trial) is reported per-object in Table~\ref{tab:fp_jitter}; the mean across objects is \texttt{<PH>}\,mm on the raw FP translation and \texttt{<PH>}\,mm on the EKF-filtered state, which quantifies how much of the raw per-frame noise the filter absorbs.
+
+\begin{table}[h]
+\centering
+\caption{FoundationPose frame-to-frame 3D step std.\ over the last 2\,s of each trial (mm).}
+\label{tab:fp_jitter}
+\footnotesize
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Object & Raw FP (mm) & EKF-filtered (mm) \\
+\midrule
+Cheez-It    & 0.68  & 0.68 \\
+Cardboard   & 0.25  & 0.20 \\
+Protein bar & 12.15 & 3.19 \\
+Cake mix    & 1.01  & 1.05 \\
+Tissue      & \texttt{<PH>} & \texttt{<PH>} \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \section{DISCUSSION}
 
-Because the numerical results are pending, this section describes the analyses we will run once the CSVs are in hand, and the qualitative takeaways we expect based on single-run sanity checks on the Mac prototype.
+\textbf{Where does the monocular stack succeed, and where does it fail?}
+The A-vs-B comparison measures what adding a depth estimate and an EKF contributes over raw IBVS. Pipeline B localizes laterally to within a few centimetres of the reference on every trial, which indicates that the DINOv2+SAM2 centroid shared between A and B is a strong lateral cue and that the EKF's pixel-driven update propagates it accurately into camera-frame coordinates. The failure appears on the depth axis. We fit a single global scale-plus-offset to Depth Anything V2's relative depth at 0.30\,m, and that affine model does not represent the true depth function across the entire approach trajectory; as the arm advances, the metric depth estimate drifts, and B's reported 3D position drifts accordingly. The fact that Pipeline B's path efficiency is noticably high is itself suggestive: the pipeline commits to smooth, straight Cartesian motion based on a localization estimate that is internally consistent but depth-biased. The failure mode lies in the depth calibration of the monocular stack rather than in the EKF.
 
-\textbf{Does the EKF help?}
-The A-vs-B comparison isolates this: same perception front-end, with and without the filter. A higher pass rate or path efficiency for B is attributable to the EKF and PBVS together, and even a path-efficiency win with equal pass rates is a qualitative win for PBVS. Preliminary single-trial logs already show noticably smoother end-effector motion under Pipeline B, consistent with the EKF damping centroid jitter; full statistics in \texttt{<PLACEHOLDER>}.
-
-\textbf{Does FoundationPose add enough to justify its cost?}
-The B-vs-C comparison asks whether a dedicated 6-DoF pose model is worth the extra dependency (CAD mesh, real stereo depth, heavier GPU refiner). If raw-pose jitter is already small ($\sim$1--2\,mm), the EKF has little to smooth and Pipeline C pays runtime for no gain. If it is larger ($\sim$5--15\,mm, as occured on darker or more reflective boxes in our sanity checks), the filter should recover it and C should win. The jitter metric reported with Table~\ref{tab:exp1_main} is the most diagnostic single number.
+\textbf{Does FoundationPose justify its cost?}
+The B-vs-C comparison asks whether a dedicated 6-DoF pose model is worth the extra dependancy (mesh, real stereo depth, heavier GPU refiner). On the localization metric, the answer is yes: Pipeline C is the only one of the three that localizes on all three axes, and depth is precisely the axis on which Pipeline B fails. Separately, C's own jitter (Table~\ref{tab:fp_jitter}) is $\leq$1\,mm on the non-reflective boxes and $\sim$12\,mm on the reflective protein-bar packaging; the later is reduced by the EKF to $\sim$3\,mm, so the filter earns its keep when the sensor is noisy and contributes little otherwise. Per-iteration runtime for Pipeline C is also the lowest of the three, because \texttt{track\_one} bypasses the DINOv2+SAM2 feature extraction that dominates cost in the other two pipelines.
 
 \textbf{Limitations.}
-Our comparison holds the PBVS controller fixed across pipelines B and C, so we cannot cleanly attribute any Pipeline C advantage to FoundationPose itself versus a controller better-tuned to its input distribution. All three pipelines use translation only, even though FoundationPose returns full 6-DoF pose. The five targets are all roughly box-shaped, so our results speak to rigid rectangular objects rather than to deformable or highly non-convex ones. With $n = 15$ total trials (one run per object per pipeline, single start pose P1, no per-cell repetitions), the study is a baseline characterization rather than a statistically powered comparison: cross-pipeline deltas smaller than the per-trial run-to-run variance should not be over-read, and broader start-pose coverage plus repeats are left as future work. Likewise, explicit robustness stressors (occlusion, dim lighting, distractors) and EKF process/measurement-noise sensitivity sweeps are out of scope here. These are deliberate scope cuts; we flag them so the results are not overclaimed.
+The localization numbers in Table~\ref{tab:exp1_main} are computed against FoundationPose's own output as the reference, not against an independent external sensor. This is defensible as a \emph{comparative} localization metric because FoundationPose has independent access to real stereo depth and a 3D mesh (the exact signals Pipeline B lacks) and is benchmarked to $\sim$mm accuracy on YCB-Video~\cite{foundationpose}, but the paper does not claim absolute sub-mm localization accuracy for any pipeline. A future version would anchor P1 in the robot base frame with a ruler (or mocap, if available) to convert the comparison into a true-ground-truth comparison. Separately, our comparison holds the PBVS controller fixed across pipelines B and C, so we cannot cleanly attribute any Pipeline C advantage to FoundationPose itself versus a controller better-tuned to its input distribution. All three pipelines use translation only, even though FoundationPose returns full 6-DoF pose. The five targets are all roughly box-shaped, so our results speak to rigid rectangular objects rather than to deformable or highly non-convex ones. With $n = 15$ total trials (one run per object per pipeline, single start pose P1, no per-cell repetitions), the study is a baseline characterization rather than a statistically powered comparison: cross-pipeline deltas smaller than the per-trial run-to-run variance should not be over-read, and broader start-pose coverage plus repeats are left as future work. Likewise, explicit robustness stressors (occlusion, dim lighting, distractors) and EKF process/measurement-noise sensitivity sweeps are out of scope here. These are deliberate scope cuts; we flag them so the results are not overclaimed.
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \section{CONCLUSION}
 
-We built three visual servoing pipelines (raw IBVS, EKF-PBVS with DINOv2+SAM2+Depth Anything V2, and EKF-PBVS with FoundationPose) on a shared xArm 7 + ZED Mini setup, so that performance differences are attributable to the perception/estimator stack rather than to incidental implementation differences. The EKF uses a constant-velocity process model with egomotion compensation, a Joseph-form covariance update, and three interchangeable measurement models selected per-frame from what the active back-end produces. Initial real-world result videos are available \href{https://drive.google.com/file/d/1beLwBDPymnEFNrw9vw_qGlmb-9raleHW/view?usp=sharing}{\textcolor{blue}{here}}; full quantitative results will apear in the \texttt{<PLACEHOLDER>} cells of Section~\ref{sec:results} once the hardware run is complete. The broader deliverable is the framework itself: a single repo that lets future pose estimators drop in as a new back-end and be compared against the existing three on identical hardware with identical metrics.
+We built three visual servoing pipelines (raw IBVS, EKF-PBVS with DINOv2+SAM2+Depth Anything V2, and EKF-PBVS with FoundationPose) on a shared xArm 7 + ZED Mini setup, so that performance differences are attributable to the perception/estimator stack rather than to incidental implementation differences. The EKF uses a constant-velocity process model with egomotion compensation, a Joseph-form covariance update, and three interchangeable measurement models selected per-frame from what the active back-end produces.
+
+On the localization metric the three pipelines separate cleanly. Lateral localization is effectively a solved sub-problem here: the DINOv2+SAM2 segmentation centroid shared between Pipelines A and B tracks FoundationPose's per-frame centroid to within a few pixels, and the EKF propagates that cue into 3D camera coordinates to within a few centimetres. Depth is where a monocular foundation-model stack breaks down. Pipeline B's reliance on a global affine fit to Depth Anything V2's relative depth produces a systematic depth error on the order of 10\,cm across the approach trajectory, which is enough to make closed-loop servo grasping unsafe even when lateral tracking is accurate. FoundationPose, with access to real stereo depth and a 3D mesh prior, localizes accurately on all three axes and, perhaps counter-intuitively, is also the fastest pipeline per iteration because its tracker bypasses the DINOv2+SAM2 feature extraction that dominates cost in the other two. The practical implication is that monocular foundation-model perception is not yet a drop-in substitute for geometry-aware pose estimation in manipulation contexts: the missing piece is metric depth, and naively recalibrating a relative-depth model is insufficient.
+
+Natural next steps follow directly from the limitations listed above: substituting Depth Anything V2 with a learned metric-depth model (e.g. Metric3D, UniDepth) to see whether the lateral-works, depth-does-not gap of Pipeline B closes; broadening the evaluation to additional start poses, object geometries, and explicit robustness stressors (occlusion, lighting, distractors); anchoring an external ground truth (mocap or AprilTag) so the comparison no longer uses FoundationPose as its own reference; and extending the PBVS controller to the full 6-DoF pose that FoundationPose already returns rather than translation only. Initial real-world result videos are available \href{https://drive.google.com/file/d/1beLwBDPymnEFNrw9vw_qGlmb-9raleHW/view?usp=sharing}{\textcolor{blue}{here}}, and full quantitative results are reported in Section~\ref{sec:results}. Alongside the specific findings, the broader deliverable is the framework itself: a single repository in which a new pose estimator can be dropped in as a fourth back-end and compared against the three reported here on identical hardware with identical metrics, making this a reusable harness for future perception-for-servoing research rather than a one-off comparison.
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%

@@ -33,6 +33,15 @@ from statistics import median
 
 DEFAULT_TOLS_CM = "0.5,1.0,2.0"
 
+# Image center for IBVS pixel-error (ZED Mini left at 1280x720).
+IMG_CX = 640.0
+IMG_CY = 360.0
+
+# A row counts as "servo-active" when any commanded delta is non-trivial.
+# Warm-up frames log zeros before PBVS engages, and the original analyzer
+# mistakenly treated those zero-err rows as converged at iteration 1.
+SERVO_ACTIVE_EPS_MM = 0.01
+
 
 def _f(row, key, default=None):
     """Parse a float cell; return default if empty / non-numeric."""
@@ -82,20 +91,53 @@ def analyze_one(path: Path, tols_m: list) -> dict:
     pipeline = rows[0].get("pipeline") or ""
     run_tag = rows[0].get("run_tag") or ""
 
-    # Error at convergence (last row with non-empty err_m)
-    err_rows = [r for r in rows if _f(r, "err_m") is not None]
-    final_err_m = _f(err_rows[-1], "err_m") if err_rows else None
+    # Index of the first frame where a non-trivial servo command was issued.
+    # Before this point the PBVS loop hasn't taken over (err_m is pinned at
+    # zero during warm-up) so those rows must be excluded from convergence
+    # scans. IBVS runs never command via err_m, so this still points to the
+    # first real motion frame.
+    first_active_idx = None
+    for idx, r in enumerate(rows):
+        dx = _f(r, "servo_dx_mm") or 0.0
+        dy = _f(r, "servo_dy_mm") or 0.0
+        dz = _f(r, "servo_dz_mm") or 0.0
+        if max(abs(dx), abs(dy), abs(dz)) > SERVO_ACTIVE_EPS_MM:
+            first_active_idx = idx
+            break
 
-    # First frame where err <= each tolerance. Single pass over rows:
-    # track the smallest unsatisfied tolerance index, check, advance.
+    # IBVS does not populate err_m (it servos in image space), so its 3D
+    # convergence columns stay None and the paper table reports them as n/a.
+    is_ibvs = pipeline == "ibvs"
+
+    # Final 3D error: last row with err_m > 0 after the servo engages.
+    final_err_m = None
+    if not is_ibvs and first_active_idx is not None:
+        for r in reversed(rows[first_active_idx:]):
+            e = _f(r, "err_m")
+            if e is not None and e > 0:
+                final_err_m = e
+                break
+
+    # First frame (1-indexed, within the servo-active window) where err <= tol.
     iters_to_tol = {t: None for t in tols_m}
-    for idx, r in enumerate(rows, 1):
-        e = _f(r, "err_m")
-        if e is None:
-            continue
-        for t in tols_m:
-            if iters_to_tol[t] is None and e <= t:
-                iters_to_tol[t] = idx
+    if not is_ibvs and first_active_idx is not None:
+        for offset, r in enumerate(rows[first_active_idx:], 1):
+            e = _f(r, "err_m")
+            if e is None or e <= 0:
+                continue
+            for t in tols_m:
+                if iters_to_tol[t] is None and e <= t:
+                    iters_to_tol[t] = offset
+
+    # IBVS pixel error: distance from last centroid to image center. Uses the
+    # same servo-active window so pre-engagement frames can't pollute.
+    final_px_err = None
+    if is_ibvs and first_active_idx is not None:
+        for r in reversed(rows[first_active_idx:]):
+            u, v = _f(r, "centroid_u"), _f(r, "centroid_v")
+            if u is not None and v is not None:
+                final_px_err = ((u - IMG_CX) ** 2 + (v - IMG_CY) ** 2) ** 0.5
+                break
 
     # FK trajectory
     fk = []
@@ -131,19 +173,40 @@ def analyze_one(path: Path, tols_m: list) -> dict:
     ts = [t for t in ts if t is not None]
     duration_s = (ts[-1] - ts[0]) if len(ts) >= 2 else None
 
-    # FoundationPose jitter (frame-to-frame stddev of raw Z, cm).
-    # Quantifies how much noise the EKF is responsible for damping.
-    fp_raw_std_cm = None
-    if pipeline == "foundationpose":
-        fp_raw = []
-        for r in rows:
-            rz = _f(r, "fp_raw_z")
-            if rz is not None:
-                fp_raw.append(rz)
-        if len(fp_raw) >= 3:
-            import statistics as st
-            diffs = [fp_raw[i] - fp_raw[i - 1] for i in range(1, len(fp_raw))]
-            fp_raw_std_cm = st.pstdev(diffs) * 100.0
+    # FoundationPose jitter: frame-to-frame 3D step stddev over the last 2 s
+    # of the trial. Reported in mm. Computed twice — once on the raw FP
+    # translation and once on the EKF-smoothed ekf_x/y/z — so the paper can
+    # quantify how much noise the filter absorbs.
+    fp_raw_step_std_mm = None
+    fp_ekf_step_std_mm = None
+    if pipeline == "foundationpose" and ts and len(ts) >= 2:
+        import statistics as st
+        t_end = ts[-1]
+        tail = [r for r in rows
+                if _f(r, "timestamp") is not None
+                and _f(r, "timestamp") >= t_end - 2.0]
+
+        def _step_std_mm(points):
+            if len(points) < 3:
+                return None
+            diffs = []
+            for i in range(1, len(points)):
+                dx = points[i][0] - points[i - 1][0]
+                dy = points[i][1] - points[i - 1][1]
+                dz = points[i][2] - points[i - 1][2]
+                diffs.append((dx * dx + dy * dy + dz * dz) ** 0.5)
+            return st.pstdev(diffs) * 1000.0
+
+        def _xyz(rs, kx, ky, kz):
+            out = []
+            for r in rs:
+                x, y, z = _f(r, kx), _f(r, ky), _f(r, kz)
+                if x is not None and y is not None and z is not None:
+                    out.append((x, y, z))
+            return out
+
+        fp_raw_step_std_mm = _step_std_mm(_xyz(tail, "fp_raw_x", "fp_raw_y", "fp_raw_z"))
+        fp_ekf_step_std_mm = _step_std_mm(_xyz(tail, "ekf_x", "ekf_y", "ekf_z"))
 
     out = {
         "file": path.name,
@@ -152,11 +215,13 @@ def analyze_one(path: Path, tols_m: list) -> dict:
         "frames": frames,
         "duration_s": duration_s,
         "final_err_cm": (final_err_m * 100.0) if final_err_m is not None else None,
+        "final_px_err": final_px_err,
         "traj_len_mm": traj_len_mm if fk else None,
         "straight_mm": straight_mm,
         "path_eff": path_eff,
         "median_iter_ms": median_iter_ms,
-        "fp_raw_step_std_cm": fp_raw_std_cm,
+        "fp_raw_step_std_mm": fp_raw_step_std_mm,
+        "fp_ekf_step_std_mm": fp_ekf_step_std_mm,
     }
     # One column per tolerance, keyed by the cm value as a float string
     for t_m in tols_m:
@@ -184,12 +249,12 @@ def print_table(rows, tols_cm):
     """
     fixed_headers = [
         ("run_tag", 28), ("pipeline", 14), ("frames", 6), ("dur_s", 7),
-        ("err_cm", 7),
+        ("err_cm", 7), ("px_err", 7),
     ]
     tol_headers = [(f"it@{_tol_key(t)}cm", 9) for t in tols_cm]
     trailing_headers = [
         ("traj_mm", 8), ("straight_mm", 11), ("path_eff", 8),
-        ("iter_ms", 8), ("fp_jit_cm", 9),
+        ("iter_ms", 8), ("fp_raw_mm", 9), ("fp_ekf_mm", 9),
     ]
     headers = fixed_headers + tol_headers + trailing_headers
 
@@ -204,6 +269,7 @@ def print_table(rows, tols_cm):
             f"{r.get('frames', 0):<6}",
             f"{fmt(r.get('duration_s'), '.1f'):<7}",
             f"{fmt(r.get('final_err_cm'), '.2f'):<7}",
+            f"{fmt(r.get('final_px_err'), '.1f'):<7}",
         ]
         for t_cm in tols_cm:
             key = f"iter_at_{_tol_key(t_cm)}cm"
@@ -213,7 +279,8 @@ def print_table(rows, tols_cm):
             f"{fmt(r.get('straight_mm'), '.1f'):<11}",
             f"{fmt(r.get('path_eff'), '.3f'):<8}",
             f"{fmt(r.get('median_iter_ms'), '.1f'):<8}",
-            f"{fmt(r.get('fp_raw_step_std_cm'), '.2f'):<9}",
+            f"{fmt(r.get('fp_raw_step_std_mm'), '.2f'):<9}",
+            f"{fmt(r.get('fp_ekf_step_std_mm'), '.2f'):<9}",
         ])
         print(" ".join(cells))
 
@@ -240,16 +307,20 @@ def print_aggregate(rows, tols_cm):
     for pipe, grp in sorted(groups.items()):
         n = len(grp)
         row = [f"{pipe:<12}", f"{n:<12}"]
+        # IBVS runs don't populate cm-space error, so the pass-rate columns
+        # stay blank rather than reporting a misleading 0/0.
+        cm_pool = [r for r in grp if r.get("final_err_cm") is not None]
         for t_cm in tols_cm:
             key = f"iter_at_{_tol_key(t_cm)}cm"
-            passed = sum(1 for r in grp if r.get(key) is not None)
-            row.append(f"{passed/n*100:5.1f}%      " if n else "-")
-        # Median final error and path efficiency across the group
-        errs = [r.get("final_err_cm") for r in grp
-                if r.get("final_err_cm") is not None]
+            if not cm_pool:
+                row.append(f"{'n/a':<12}")
+                continue
+            passed = sum(1 for r in cm_pool if r.get(key) is not None)
+            row.append(f"{passed/len(cm_pool)*100:5.1f}%      ")
+        errs = [r.get("final_err_cm") for r in cm_pool]
         effs = [r.get("path_eff") for r in grp
                 if r.get("path_eff") is not None]
-        row.append(f"{median(errs):<12.2f}" if errs else f"{'-':<12}")
+        row.append(f"{median(errs):<12.2f}" if errs else f"{'n/a':<12}")
         row.append(f"{median(effs):<12.3f}" if effs else f"{'-':<12}")
         print("  " + "  ".join(row))
 
@@ -294,12 +365,12 @@ def main():
         # Dynamic fieldnames: core columns plus one iter_at_*cm per tolerance
         base_fields = [
             "file", "pipeline", "run_tag", "frames", "duration_s",
-            "final_err_cm",
+            "final_err_cm", "final_px_err",
         ]
         tol_fields = [f"iter_at_{_tol_key(t)}cm" for t in tols_cm]
         trail_fields = [
             "traj_len_mm", "straight_mm", "path_eff",
-            "median_iter_ms", "fp_raw_step_std_cm",
+            "median_iter_ms", "fp_raw_step_std_mm", "fp_ekf_step_std_mm",
         ]
         fieldnames = base_fields + tol_fields + trail_fields
         with args.csv.open("w", newline="") as f:
