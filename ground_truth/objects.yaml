@@ -1,0 +1,13 @@
+# Object dimensions database for ground-truth corner registration.
+#
+# Format:
+#   <object_name>:
+#     dimensions_mm: [length, width, height]
+#
+# length = longest edge of the top face (the face you probe)
+# width  = other edge of the top face (shorter)
+# height = thickness perpendicular to the top face
+#
+# Populated interactively by record_corners.py on first use per object.
+# Edit entries here if you re-measure with calipers, or if the FoundationPose
+# fp_box values in experiments/trials_threeway.yaml change.
