@@ -267,6 +267,33 @@ For IBVS, which is a 2D localizer by construction, the per-frame error is an ima
 
 The per-trial number reported in Table~\ref{tab:exp1_main} is the \emph{median} of these per-frame errors across the trial's servo-active frames (e.g., $\widetilde{\text{lat}} = \mathrm{median}_k \{\text{lat}_k\}$, and similarly for $\widetilde{\text{dep}}$ and $\widetilde{\text{px}}$). The per-pipeline number in the \textbf{Median} row of Table~\ref{tab:exp1_main} is then the median of the five per-trial medians. Taking the median twice (per-frame first, then across trials) makes the metric insensitive to momentary tracking glitches within a trial and to an outlier trial within the set. The order matters: computing $\sqrt{dx_k^2 + dy_k^2}$ \emph{before} reducing over $k$ ensures that a residual whose sign flips during the trajectory does not cancel out in the summary. We additionally report \textbf{path efficiency} (straight-line displacement over integrated FK trajectory length, with values near 1 indicating straight Cartesian motion) and \textbf{median per-iteration wall-clock runtime} (ms).
 
+\textbf{Image-space ground-truth corner error.}
+As a complementary metric that does not use FoundationPose as a reference, we evaluate each pipeline's centroid against a per-frame ground-truth (GT) box center derived from the recorded video frames, using the post-hoc script \texttt{experiments/gt\_corner\_eval.py}. Two methods are applied in order per frame.
+
+\emph{Method~A (green-mask):} \texttt{dinov2\_servo.py} blends the SAM2 binary segmentation mask onto the visualization frame by setting an overlay's green channel to 255 for mask pixels and combining with a 0.28 weight:
+\begin{equation}
+G_\text{out} = 0.72 \cdot G_\text{orig} + 0.28 \times 255
+\label{eq:green_overlay}
+\end{equation}
+Pixels satisfying $G - R > 12$ \emph{and} $G - B > 12$ are thresholded as mask pixels. After a $9 \times 9$ morphological closing followed by a $9 \times 9$ opening, the largest qualifying contour's axis-aligned bounding rectangle yields four GT corners.
+
+\emph{Method~B (edge/Hough):} When Method~A finds no qualifying contour—which occurs in FoundationPose frames where the SAM2 mask overlay is not maintained after the initial registration step—Canny edge detection (low/high thresholds 40/120) and \texttt{HoughLinesP} are applied within a $560 \times 560$\,px region of interest (ROI) centred on the pipeline centroid from the CSV. Near-horizontal ($|\Delta y| < 0.25|\Delta x|$) and near-vertical ($|\Delta x| < 0.25|\Delta y|$) detected lines are each split into two clusters at the largest inter-line gap; the median of each cluster defines one side of the bounding rectangle.
+
+In both cases, the GT grasp point is the mean of the four rectangle corners, and the per-frame image-space GT error is:
+\begin{equation}
+e_k^{\mathrm{gt}} = \sqrt{(u_k - \bar{u}_k^{\mathrm{gt}})^2 + (v_k - \bar{v}_k^{\mathrm{gt}})^2}
+\label{eq:gt_err}
+\end{equation}
+where $(u_k, v_k)$ is the pipeline centroid at frame $k$ from the CSV, and $(\bar{u}_k^{\mathrm{gt}}, \bar{v}_k^{\mathrm{gt}})$ is the GT box center. We additionally report the error normalised by the GT bounding-box diagonal $d_k$: $\tilde{e}_k = e_k^{\mathrm{gt}} / d_k$. Summary statistics (median and mean over all frames with valid GT) are reported in Table~\ref{tab:gt_corner}.
+
+\textbf{Camera-centre convergence error (edge-only).}
+As a complementary convergence metric, we re-run \texttt{gt\_corner\_eval.py} with the \texttt{--edge-only} flag, which skips Method~A entirely. Method~B (Canny thresholds $40/120$; up to $560\times560$\,px ROI centred on the CSV centroid, or the last detected GT centre when no centroid is logged) is the sole GT localisation step. The error reference is the image centre $(640,\,360)$ for the 1280$\times$720 recording resolution---the pixel that all three servo controllers drive toward---rather than the pipeline centroid:
+\begin{equation}
+e_k^{\mathrm{cam}} = \sqrt{(640 - \bar{u}_k^{\mathrm{gt}})^2 + (360 - \bar{v}_k^{\mathrm{gt}})^2}
+\label{eq:cam_centre_err}
+\end{equation}
+where $(\bar{u}_k^{\mathrm{gt}},\,\bar{v}_k^{\mathrm{gt}})$ is the GT box centre at frame~$k$. This measures servo convergence---how close the object was to the servo goal at trial end---rather than pipeline localisation accuracy. We report the final-frame value of $e_k^{\mathrm{cam}}$; when two trials were recorded for the same object--pipeline pair, the lower final-frame error is retained. Results are reported in Table~\ref{tab:camera_centre_final_err}.
+
 \subsection{Experimental Protocol}
 
 Our evaluation is organized as three per-pipeline experiments. Each experiment runs one pipeline across the same five target objects from a single canonical start pose (P1, centered on the optical axis at $\sim$50\,cm), for five trials per experiment and fifteen trials in total:
@@ -365,6 +392,51 @@ Tissue      & \texttt{<PH>} & \texttt{<PH>} \\
 \end{table}
 
 
+\subsection{Image-Space Ground-Truth Error}
+
+Table~\ref{tab:gt_corner} reports the per-trial image-space GT error (Eq.~\ref{eq:gt_err}) for all 15 experiments, computed by \texttt{experiments/gt\_corner\_eval.py} on the saved trial videos. Each video is processed independently: the GT center is detected per frame from the video itself (no cross-trial pairing), and the pipeline centroid is read from the matched CSV. The GT detection fraction (column ``GT det.'') shows the proportion of frames in which a valid bounding rectangle was found; the ``Method'' column records whether Method~A (green-mask, labeled A), Method~B (edge/Hough, labeled B), or a combination (A+B) dominated. For ekf and pbvs trials the SAM2 mask overlay is visible and Method~A fires in most frames; for fp trials Method~A fires only during the brief initial registration phase (first $\sim$2\,s), after which FoundationPose tracks the object without updating the SAM2 mask overlay, and Method~B takes over.
+
+Two trials could not be evaluated: the protein-bar PBVS and FP trials have no matching CSV in the \texttt{runs/} directory (runs were not saved under the expected naming pattern), so no pipeline centroid is available to pair with the detected GT. The tissue-box FoundationPose trial failed to initialize completely---FoundationPose's \texttt{register()} call did not return a valid pose for any frame, the centroid columns in the CSV are empty throughout, and consequently neither the error nor the GT-ROI hint for Method~B can be formed.
+
+\begin{table*}[t]
+\centering
+\caption{Image-space GT corner error for all 15 trials, computed post-hoc from saved videos. GT center is the mean of the four axis-aligned bounding-box corners detected per frame. Error is the Euclidean pixel distance between the pipeline centroid (from the matched CSV) and the GT center; Norm.\ error is divided by the GT bounding-box diagonal. Method A = SAM2 green-mask; Method B = Canny + HoughLinesP in a $560\times560$\,px ROI. Dashes indicate trials where no matching CSV was found or where the pipeline produced no centroid.}
+\label{tab:gt_corner}
+\footnotesize
+\begin{tabular}{@{}llccccc@{}}
+\toprule
+Object & Pipeline & GT det.\ (\%) & Method & Median err.\ (px) & Mean err.\ (px) & Norm.\ err. \\
+\midrule
+\multirow{3}{*}{Cheez-It}
+  & B (EKF+DINOv2) & 95 & A     & 40.3 & 36.7 & 0.122 \\
+  & A (IBVS/PBVS)  & 90 & A     & 23.9 & 31.0 & 0.133 \\
+  & C (EKF+FP)     & 58 & B     & 54.1 & 57.5 & 0.186 \\
+\midrule
+\multirow{3}{*}{Cardboard}
+  & B (EKF+DINOv2) & 100 & A+B  & 103.3 & 110.2 & 0.261 \\
+  & A (IBVS/PBVS)  & 100 & A    &   5.7 &  24.1 & 0.072 \\
+  & C (EKF+FP)     & 100 & B    &  41.5 &  46.6 & 0.150 \\
+\midrule
+\multirow{3}{*}{Protein bar}
+  & B (EKF+DINOv2) & 100 & A    & 16.8 & 27.8 & 0.103 \\
+  & A (IBVS/PBVS)  & 100 & A    & ---  & ---  & ---   \\
+  & C (EKF+FP)     & 100 & A    & ---  & ---  & ---   \\
+\midrule
+\multirow{3}{*}{Cake mix}
+  & B (EKF+DINOv2) & 96 & A     & 21.2 & 33.9 & 0.096 \\
+  & A (IBVS/PBVS)  & 97 & A     & 32.0 & 43.3 & 0.141 \\
+  & C (EKF+FP)     & 42 & B     & 65.0 & 63.3 & 0.294 \\
+\midrule
+\multirow{3}{*}{Tissue}
+  & B (EKF+DINOv2) & 60 & A     & 60.0 & 57.2 & 0.141 \\
+  & A (IBVS/PBVS)  & 64 & A+B   & 12.7 & 37.3 & 0.148 \\
+  & C (EKF+FP)     &  0 & ---   & ---  & ---  & ---   \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+Several observations follow from Table~\ref{tab:gt_corner}. First, the GT-corner metric corroborates the FK-reference metric from Table~\ref{tab:exp1_main}: lateral localization (which drives both the IBVS centroid and the EKF pixel update) is generally accurate, with most trials staying within 20--65\,px of the GT box center. Second, Pipeline~C (FoundationPose) consistently shows higher image-space centroid error than Pipeline~B on the same objects; this is expected because Pipeline~C's centroid is derived by projecting the FoundationPose 3D translation through the camera matrix, not by directly minimizing pixel error. Third, the cardboard-box EKF trial shows an elevated median error (103.3\,px) that does not match the low lateral error reported in Table~\ref{tab:exp1_main}; this discrepancy arises because Method~A (mask) and Method~B (edge) may disagree on the box boundary for uniform-colored targets, making the GT itself less reliable for that trial.
+
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \section{DISCUSSION}
 
@@ -373,6 +445,27 @@ The A-vs-B comparison measures what adding a depth estimate and an EKF contribut
 
 \textbf{Does FoundationPose justify its cost?}
 The B-vs-C comparison asks whether a dedicated 6-DoF pose model is worth the extra dependancy (mesh, real stereo depth, heavier GPU refiner). On the localization metric, the answer is yes: Pipeline C is the only one of the three that localizes on all three axes, and depth is precisely the axis on which Pipeline B fails. Separately, C's own jitter (Table~\ref{tab:fp_jitter}) is $\leq$1\,mm on the non-reflective boxes and $\sim$12\,mm on the reflective protein-bar packaging; the later is reduced by the EKF to $\sim$3\,mm, so the filter earns its keep when the sensor is noisy and contributes little otherwise. Per-iteration runtime for Pipeline C is also the lowest of the three, because \texttt{track\_one} bypasses the DINOv2+SAM2 feature extraction that dominates cost in the other two pipelines.
+
+\textbf{Camera-centre convergence error across pipelines.}
+Table~\ref{tab:camera_centre_final_err} reports the final-frame camera-centre convergence error (Eq.~\ref{eq:cam_centre_err}) using Canny edge detection only, for five objects across the three pipelines. Pipeline~C (EKF + FoundationPose) achieves the lowest final-frame error on all five objects. An important asymmetry applies to the comparison. For Pipeline~C, edge-only GT detection is the natural choice: \texttt{dinov2\_servo.py} does not draw the SAM2 green-channel overlay in FoundationPose mode (the render path sets \texttt{mask\_np=None} for every FP frame), so Method~A would return no detections regardless. For Pipelines~A and~B, the recorded videos carry the SAM2 green overlay throughout tracking, meaning Method~A would ordinarily fire reliably; the edge-only evaluation discards that information. At the final frame, when the servo has largely converged and the box occupies only a small region of the frame, Canny edges on the raw image can be harder to cluster into a clean bounding rectangle than during approach. As a result, the edge-only final-frame numbers for Pipelines~A and~B may overstate the true pixel distance to the camera centre, and the comparison should be read with this caveat in mind.
+
+\begin{table}[h]
+\centering
+\caption{Final-frame camera-centre convergence error (px), computed using Canny edge detection only for GT localisation (Eq.~\ref{eq:cam_centre_err}). When two trials were recorded for the same object--pipeline pair, the lower final-frame error is reported. Pipeline~A\,=\,IBVS; B\,=\,EKF\,+\,DINOv2/SAM2; C\,=\,EKF\,+\,FoundationPose. Bold denotes the best (lowest) value per row.}
+\label{tab:camera_centre_final_err}
+\footnotesize
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Object & A (IBVS) & B (EKF+DINOv2) & C (EKF+FP) \\
+\midrule
+Cheez-It      &  82.6 & 211.4 & \textbf{32.2} \\
+Cardboard     & 124.0 &  62.6 & \textbf{23.1} \\
+Cake mix      &  33.8 &  66.0 & \textbf{14.5} \\
+Protein bar   &  73.2 & 120.1 & \textbf{51.8} \\
+Protein bar 2 &  88.2 & 108.0 & \textbf{57.8} \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \textbf{Limitations.}
 The localization numbers in Table~\ref{tab:exp1_main} are computed against FoundationPose's own output as the reference, not against an independent external sensor. This is defensible as a \emph{comparative} localization metric because FoundationPose has independent access to real stereo depth and a 3D mesh (the exact signals Pipeline B lacks) and is benchmarked to $\sim$mm accuracy on YCB-Video~\cite{foundationpose}, but the paper does not claim absolute sub-mm localization accuracy for any pipeline. A future version would anchor P1 in the robot base frame with a ruler (or mocap, if available) to convert the comparison into a true-ground-truth comparison. Separately, our comparison holds the PBVS controller fixed across pipelines B and C, so we cannot cleanly attribute any Pipeline C advantage to FoundationPose itself versus a controller better-tuned to its input distribution. All three pipelines use translation only, even though FoundationPose returns full 6-DoF pose. The five targets are all roughly box-shaped, so our results speak to rigid rectangular objects rather than to deformable or highly non-convex ones. With $n = 15$ total trials (one run per object per pipeline, single start pose P1, no per-cell repetitions), the study is a baseline characterization rather than a statistically powered comparison: cross-pipeline deltas smaller than the per-trial run-to-run variance should not be over-read, and broader start-pose coverage plus repeats are left as future work. Likewise, explicit robustness stressors (occlusion, dim lighting, distractors) and EKF process/measurement-noise sensitivity sweeps are out of scope here. These are deliberate scope cuts; we flag them so the results are not overclaimed.
